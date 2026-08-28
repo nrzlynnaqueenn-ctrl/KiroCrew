@@ -174,9 +174,11 @@ class TestPolicyDocument:
         assert "StringEquals" not in st["Condition"], "must be ArnLike, not StringEquals"
         cond = st["Condition"]["ArnLike"]["iam:PermissionsBoundary"]
         values = [cond] if isinstance(cond, str) else list(cond)
-        # Either shared boundary name, no trailing wildcard on the policy name.
-        assert f"arn:aws:iam::*:policy/{iam.BOUNDARY_NAME}" in values
-        assert f"arn:aws:iam::*:policy/{iam.AGENTCORE_BOUNDARY_NAME}" in values
+        # Original shared boundary only — no trailing wildcard on the policy
+        # name. The successor ceiling includes token verbs the launcher can
+        # still PutRolePolicy, so CreateRole must not attach it.
+        assert values == [f"arn:aws:iam::*:policy/{iam.BOUNDARY_NAME}"]
+        assert f"arn:aws:iam::*:policy/{iam.AGENTCORE_BOUNDARY_NAME}" not in values
         assert all(v.startswith("arn:aws:iam::") for v in values)
         assert not any(v.endswith("*") for v in values)
 
@@ -237,8 +239,8 @@ class TestPolicyDocument:
         resources = st["Resource"]
         if isinstance(resources, str):
             resources = [resources]
-        assert f"arn:aws:iam::*:policy/{iam.BOUNDARY_NAME}" in resources
-        assert f"arn:aws:iam::*:policy/{iam.AGENTCORE_BOUNDARY_NAME}" in resources
+        assert resources == [f"arn:aws:iam::*:policy/{iam.BOUNDARY_NAME}"]
+        assert f"arn:aws:iam::*:policy/{iam.AGENTCORE_BOUNDARY_NAME}" not in resources
         # No trailing wildcard on the policy name (would let CreatePolicy target
         # other, e.g. permissive, boundary-prefixed names).
         assert not any(r.endswith("*") for r in resources)

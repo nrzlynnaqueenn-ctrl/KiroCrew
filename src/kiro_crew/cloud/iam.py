@@ -62,31 +62,30 @@ _KNOWN_BOUNDARY_NAMES = frozenset({BOUNDARY_NAME, AGENTCORE_BOUNDARY_NAME})
 # Fleet-pinned AgentCore ARNs. Instance-fragment Allows never use ``*``;
 # explicit Deny SIDs may. A CloudFormation launch names the standalone
 # identity ``kirocrew-<StackTag>``; a hand-rolled fleet may still use
-# ``kirocrew``. Gateway ``kirocrew-*``.
+# ``kirocrew``. Invoke is not granted on ``gateway/kirocrew-*``.
 _AGENTCORE_WORKLOAD_DIR_ARN = "arn:aws:bedrock-agentcore:*:*:workload-identity-directory/default"
 _AGENTCORE_WORKLOAD_ID_ARN = (
     "arn:aws:bedrock-agentcore:*:*:workload-identity-directory/default/"
     "workload-identity/kirocrew"
 )
-_AGENTCORE_WORKLOAD_ID_WILDCARD_ARN = (
-    "arn:aws:bedrock-agentcore:*:*:workload-identity-directory/default/"
-    "workload-identity/kirocrew-*"
-)
-_AGENTCORE_GATEWAY_ARN = "arn:aws:bedrock-agentcore:*:*:gateway/kirocrew-*"
 # Inspect of an operator-pasted existing Gateway (not only kirocrew-*).
-# Invoke stays on ``kirocrew-*``. A bare ``*`` resource is still refused.
+# Invoke is not granted until the operator scopes it to one Gateway.
+# A bare ``*`` resource is still refused.
 _AGENTCORE_GATEWAY_ANY_ARN = "arn:aws:bedrock-agentcore:*:*:gateway/*"
+# Token grants are the exact ``kirocrew`` identity plus its directory —
+# never ``kirocrew-*``. Two tagged identities plus a wildcard grant
+# would let one crew mint a sibling bearer. A tagged launch that needs
+# ``kirocrew-<tag>`` emits that exact ARN at generate time (CFN uses
+# ``!GetAtt CrewWorkloadIdentity.WorkloadIdentityArn``).
 _AGENTCORE_WORKLOAD_RESOURCES = [
     _AGENTCORE_WORKLOAD_DIR_ARN,
     _AGENTCORE_WORKLOAD_ID_ARN,
-    _AGENTCORE_WORKLOAD_ID_WILDCARD_ARN,
 ]
 _AGENTCORE_LAUNCH_POSTURES = frozenset({"none", "workload", "login"})
 _AGENTCORE_INSPECT_ACTIONS = [
     "bedrock-agentcore:GetGateway",
     "bedrock-agentcore:ListGatewayTargets",
     "bedrock-agentcore:GetGatewayTarget",
-    "bedrock-agentcore:SynchronizeGatewayTargets",
 ]
 _INSTANCE_POSTURES = frozenset({"workload", "login"})
 
@@ -95,8 +94,11 @@ def boundary_arn(account: str, name: str | None = None) -> str:
     """The deterministic ARN of a shared, immutable instance permissions boundary.
 
     ``account`` is the 12-digit AWS account id. ``name`` defaults to
-    :data:`BOUNDARY_NAME` (the default launch path). AgentCore launches pass
-    :data:`AGENTCORE_BOUNDARY_NAME`.
+    :data:`BOUNDARY_NAME` (the launch CreateRole path). The successor
+    :data:`AGENTCORE_BOUNDARY_NAME` is administrator-pre-created
+    (``iam-boundary --agentcore``) and passed on AgentCore-posture
+    CreateRole. The generated launcher grant still matches the
+    original name only, so that CreateRole needs admin credentials.
     """
     policy_name = name or BOUNDARY_NAME
     if policy_name not in _KNOWN_BOUNDARY_NAMES:
@@ -212,9 +214,11 @@ def agentcore_instance_policy_document(posture: str) -> dict[str, Any]:
     This is the labeled sibling of :func:`policy_document` — paste it onto the
     *instance* role, never the launch principal. A CloudFormation launch
     attaches the same verbs automatically. Resource ARNs are fleet-pinned
-    (workload ``kirocrew`` / ``kirocrew-*``, Invoke on gateway ``kirocrew-*``)
-    except inspect (``gateway/*``, so an existing pasted Gateway is
-    catalogable) and explicit Deny SIDs.
+    (workload ``kirocrew`` only) except inspect (``gateway/*``,
+    so an existing pasted Gateway is catalogable) and explicit Deny SIDs.
+    ``InvokeGateway`` is omitted until the operator attaches a grant
+    scoped to the configured Gateway — ``kirocrew-*`` would let one
+    crew invoke a sibling in the same account.
     """
     if posture not in _INSTANCE_POSTURES:
         raise ValueError(
@@ -230,15 +234,8 @@ def agentcore_instance_policy_document(posture: str) -> dict[str, Any]:
                     "Effect": "Allow",
                     "Action": [
                         "bedrock-agentcore:GetWorkloadAccessToken",
-                        "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
                     ],
                     "Resource": list(_AGENTCORE_WORKLOAD_RESOURCES),
-                },
-                {
-                    "Sid": "AgentCoreGateway",
-                    "Effect": "Allow",
-                    "Action": ["bedrock-agentcore:InvokeGateway"],
-                    "Resource": _AGENTCORE_GATEWAY_ARN,
                 },
                 inspect,
                 {
@@ -273,11 +270,11 @@ def agentcore_instance_policy_document(posture: str) -> dict[str, Any]:
 
 
 def _gateway_inspect_statement() -> dict[str, Any]:
-    """Read + optional Sync on any Gateway the operator pastes.
+    """Read-only inspect on any Gateway the operator pastes.
 
-    Invoke stays on ``kirocrew-*``. Settings catalog needs Get/List/GetTarget
-    on ``gateway/*`` so an existing Gateway URL is inspectable. Sync refreshes
-    a DEFAULT listing-mode target; it is not InvokeGateway.
+    Invoke is not granted here. Settings catalog needs Get/List/GetTarget
+    on ``gateway/*`` so an existing Gateway URL is inspectable. Sync is a
+    mutating control-plane verb and is not granted here.
     """
     return {
         "Sid": "AgentCoreGatewayInspect",
@@ -314,11 +311,9 @@ def agentcore_boundary_policy_document(
             "Effect": "Allow",
             "Action": [
                 "bedrock-agentcore:GetWorkloadAccessToken",
-                "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
                 "bedrock-agentcore:GetWorkloadAccessTokenForJWT",
-                "bedrock-agentcore:InvokeGateway",
             ],
-            "Resource": list(_AGENTCORE_WORKLOAD_RESOURCES) + [_AGENTCORE_GATEWAY_ARN],
+            "Resource": list(_AGENTCORE_WORKLOAD_RESOURCES),
         }
     )
     statements.append(
@@ -606,10 +601,14 @@ def policy_document() -> dict[str, Any]:
             "Resource": f"arn:aws:iam::*:role/{ROLE_NAME_PREFIX}*",
             "Condition": {
                 "ArnLike": {
-                    "iam:PermissionsBoundary": [
-                        f"arn:aws:iam::*:policy/{BOUNDARY_NAME}",
-                        f"arn:aws:iam::*:policy/{AGENTCORE_BOUNDARY_NAME}",
-                    ]
+                    # Original boundary only. The successor ceiling includes
+                    # GetWorkloadAccessToken*, and PutRolePolicy can still
+                    # attach those verbs, so a leaked launcher credential
+                    # that CreateRole'd a successor-bounded role could mint
+                    # a sibling token. AgentCore-posture deploy passes the
+                    # successor ARN; this grant stays original-only so that
+                    # CreateRole requires admin credentials.
+                    "iam:PermissionsBoundary": f"arn:aws:iam::*:policy/{BOUNDARY_NAME}",
                 }
             },
         },
@@ -710,7 +709,8 @@ def policy_document() -> dict[str, Any]:
             # CloudFormation creates AWS::BedrockAgentCore::WorkloadIdentity on
             # an AgentCore launch. These are CONTROL-PLANE verbs for the
             # launch principal — not InvokeGateway / GetWorkloadAccessToken*
-            # (those stay on the instance role). Scoped to kirocrew / kirocrew-*.
+            # (those stay on the instance role). Scoped to the directory
+            # plus the exact ``kirocrew`` identity, never ``kirocrew-*``.
             "Sid": "AgentCoreWorkloadIdentityControlPlane",
             "Effect": "Allow",
             "Action": [
@@ -763,10 +763,21 @@ def policy_document() -> dict[str, Any]:
                 "iam:GetPolicy",
                 "iam:GetPolicyVersion",
             ],
-            "Resource": [
-                f"arn:aws:iam::*:policy/{BOUNDARY_NAME}",
-                f"arn:aws:iam::*:policy/{AGENTCORE_BOUNDARY_NAME}",
+            "Resource": f"arn:aws:iam::*:policy/{BOUNDARY_NAME}",
+        },
+        {
+            # The AgentCore successor boundary is administrator-pre-created
+            # (``kirocrew cloud iam-boundary``). The launcher may only *read*
+            # it so source verification can refuse a permissive document.
+            # CreatePolicy here would let a leaked launcher credential mint
+            # that name, then CreateRole against it.
+            "Sid": "IamAgentCoreBoundaryRead",
+            "Effect": "Allow",
+            "Action": [
+                "iam:GetPolicy",
+                "iam:GetPolicyVersion",
             ],
+            "Resource": f"arn:aws:iam::*:policy/{AGENTCORE_BOUNDARY_NAME}",
         },
         {
             # Attach/detach are split out and constrained by iam:PolicyARN to the
