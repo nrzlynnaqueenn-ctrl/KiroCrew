@@ -186,9 +186,7 @@ class TestAgentRegistration:
         monkeypatch.setattr(bridges_mod, "_global_mcp_specs", lambda: {})
         src = _make_app_source(tmp_path)
         (src / "agents" / "my-agent.json").write_text(
-            json.dumps(
-                {"name": "my-agent", "model": "auto", "tools": ["fs_read", "@ghost/summon"]}
-            )
+            json.dumps({"name": "my-agent", "model": "auto", "tools": ["fs_read", "@ghost/summon"]})
         )
         install_app(src)
         manifest = AppManifest.from_json_file(
@@ -200,9 +198,7 @@ class TestAgentRegistration:
             registered = _register_agents("test-app", manifest, app_root)
 
         assert "test-app/my-agent" in registered  # still registers
-        warning = "\n".join(
-            r.getMessage() for r in caplog.records if r.levelname == "WARNING"
-        )
+        warning = "\n".join(r.getMessage() for r in caplog.records if r.levelname == "WARNING")
         assert "silently never mount" in warning
         assert "@ghost/summon" in warning
         assert "my-agent" in warning
@@ -222,9 +218,7 @@ class TestAgentRegistration:
         from kiro_crew.apps import bridges as bridges_mod
 
         monkeypatch.setattr(bridges_mod, "_global_mcp_specs", lambda: {"ambient-srv": {}})
-        src = _make_app_source(
-            tmp_path, mcpServers={"srv": {"command": "echo", "args": []}}
-        )
+        src = _make_app_source(tmp_path, mcpServers={"srv": {"command": "echo", "args": []}})
         (src / "agents" / "my-agent.json").write_text(
             json.dumps(
                 {
@@ -325,9 +319,7 @@ class TestAgentRegistration:
         assert link.read_text(encoding="utf-8") == good, "…with its old contents intact"
 
     @pytest.mark.parametrize("content", ["[1, 2, 3]", "42", "null", "true", '"a string"'])
-    def test_a_valid_json_non_object_agent_spec_is_skipped(
-        self, tmp_path, app_env, content
-    ):
+    def test_a_valid_json_non_object_agent_spec_is_skipped(self, tmp_path, app_env, content):
         """A spec that is valid JSON but not an object parses fine, so the
         JSONDecodeError guard never fires — but ``.get`` on the parsed value
         would raise AttributeError and take down the whole registration pass.
@@ -988,9 +980,9 @@ class TestMCPRegistration:
         registered = _register_mcp_servers("test-app", manifest)
         assert registered == ["test-app:my-mcp"]
 
-        written = json.loads(mcp_path.read_text(encoding="utf-8"))["mcpServers"][
-            "test-app:my-mcp"
-        ]["env"]
+        written = json.loads(mcp_path.read_text(encoding="utf-8"))["mcpServers"]["test-app:my-mcp"][
+            "env"
+        ]
         entries = written["PATH"].split(os.pathsep)
         assert entries[0] == "/opt/shims", "manifest-authored entries stay first"
         assert "/usr/bin" in entries, "inherited PATH must survive the override"
@@ -1265,7 +1257,11 @@ def _fake_venv_python(app_root: Path) -> Path:
 
     Non-empty and executable on purpose: the resolver rejects zero-byte files
     (the Microsoft-Store-stub / interrupted-copy shape) and files without the
-    execute bit.
+    execute bit. The resolver's usability PROBE (which would execute the
+    interpreter under the OS sandbox) is stubbed for this module by the
+    ``_stub_venv_probe`` autouse fixture — these tests pin the command-rewrite
+    plumbing, and the probe itself is pinned by
+    ``test_apps_backend_coverage.TestInterpreterResolution``.
     """
     if platform_compat.IS_WINDOWS:
         py = app_root / ".venv" / "Scripts" / "python.exe"
@@ -1275,6 +1271,25 @@ def _fake_venv_python(app_root: Path) -> Path:
     py.write_text("#!/bin/sh\n")
     py.chmod(0o755)
     return py
+
+
+@pytest.fixture(autouse=True)
+def _stub_venv_probe(monkeypatch):
+    """Replace the interpreter usability probe with its runnability check.
+
+    The real probe executes the candidate interpreter under the OS sandbox;
+    on hosts without a sandbox backend (Windows CI) it correctly reports "no
+    positive evidence" and the venv is never preferred — which would flip
+    every rewrite-plumbing expectation in this module per-platform. The
+    plumbing is what these tests pin; the probe has its own dedicated tests.
+    """
+    from kiro_crew.apps import interpreter as _interp
+
+    monkeypatch.setattr(
+        _interp,
+        "_venv_is_usable",
+        lambda root: _interp._runnable(_interp.venv_python_path(root)),
+    )
 
 
 class TestStdioInterpreterResolution:
@@ -1306,9 +1321,7 @@ class TestStdioInterpreterResolution:
         data = json.loads(mcp_path.read_text(encoding="utf-8"))
         return data["mcpServers"]["test-app:srv"]
 
-    def test_bare_python_resolves_to_the_app_venv_interpreter(
-        self, tmp_path, app_env, monkeypatch
-    ):
+    def test_bare_python_resolves_to_the_app_venv_interpreter(self, tmp_path, app_env, monkeypatch):
         import sys
 
         created: list[Path] = []
@@ -1377,15 +1390,14 @@ class TestStdioInterpreterResolution:
         )
         assert entry["command"] == "../data/evil"
 
-    def test_a_venv_provided_console_script_is_resolved(
-        self, tmp_path, app_env, monkeypatch
-    ):
+    def test_a_venv_provided_console_script_is_resolved(self, tmp_path, app_env, monkeypatch):
         # A console script pip installed into the app venv is invisible to PATH
         # (the venv is never activated) — resolving it is what makes such a
         # manifest work at all.
         created: list[Path] = []
 
         def make_script(app_root: Path) -> None:
+            _fake_venv_python(app_root)
             if platform_compat.IS_WINDOWS:
                 script = app_root / ".venv" / "Scripts" / "my-mcp-server.exe"
             else:
@@ -1401,12 +1413,8 @@ class TestStdioInterpreterResolution:
         )
         assert entry["command"] == str(created[0])
 
-    @pytest.mark.skipif(
-        platform_compat.IS_WINDOWS, reason="Windows has no execute bit to drop"
-    )
-    def test_a_non_executable_venv_interpreter_is_not_used(
-        self, tmp_path, app_env, monkeypatch
-    ):
+    @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="Windows has no execute bit to drop")
+    def test_a_non_executable_venv_interpreter_is_not_used(self, tmp_path, app_env, monkeypatch):
         # A venv python that lost its execute bit (truncated copy, permissions
         # dropped in transit) must not displace the always-runnable
         # sys.executable fallback — rewriting to it guarantees EACCES at spawn.
@@ -1422,9 +1430,7 @@ class TestStdioInterpreterResolution:
         )
         assert entry["command"] == sys.executable
 
-    @pytest.mark.skipif(
-        platform_compat.IS_WINDOWS, reason="Windows has no execute bit to drop"
-    )
+    @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="Windows has no execute bit to drop")
     def test_a_non_executable_venv_file_never_displaces_a_path_command(
         self, tmp_path, app_env, monkeypatch
     ):
@@ -1453,7 +1459,9 @@ class TestStdioInterpreterResolution:
         import sys
 
         entry = self._register_stdio(
-            tmp_path, app_env, monkeypatch,
+            tmp_path,
+            app_env,
+            monkeypatch,
             {"command": "python3", "args": ["-s", "-m", "kiro_crew.apps.builtins.x.server"]},
             setup=_fake_venv_python,
         )
@@ -1477,9 +1485,7 @@ class TestStdioInterpreterResolution:
         not platform_compat.IS_WINDOWS,
         reason="drive-qualified names are a Windows path form",
     )
-    def test_a_drive_qualified_command_is_never_rewritten(
-        self, tmp_path, app_env, monkeypatch
-    ):
+    def test_a_drive_qualified_command_is_never_rewritten(self, tmp_path, app_env, monkeypatch):
         # `D:foo` carries no separator but names a different drive; joining it
         # under `.venv\Scripts` would DISCARD the venv anchor (pathlib treats
         # the right operand as a new anchor), so the guard must reject it.
@@ -1489,9 +1495,7 @@ class TestStdioInterpreterResolution:
         )
         assert entry["command"] == "D:foo"
 
-    def test_a_zero_byte_venv_interpreter_is_not_used(
-        self, tmp_path, app_env, monkeypatch
-    ):
+    def test_a_zero_byte_venv_interpreter_is_not_used(self, tmp_path, app_env, monkeypatch):
         # The interrupted-copy / Store-stub shape: a zero-byte python.exe
         # passes the Windows extension check (there is no execute bit), so the
         # resolver must reject empty files on every platform.
@@ -1534,25 +1538,22 @@ class TestStdioInterpreterResolution:
         )
         assert entry["command"] == sys.executable
 
-    def test_separate_value_options_do_not_break_the_pin_scan(
-        self, tmp_path, app_env, monkeypatch
-    ):
+    def test_separate_value_options_do_not_break_the_pin_scan(self, tmp_path, app_env, monkeypatch):
         # -X / -W / --check-hash-based-pycs consume the NEXT token as a value;
         # the scanner must skip that value instead of reading it as the script
         # operand and missing the -m that follows.
         import sys
 
         entry = self._register_stdio(
-            tmp_path, app_env, monkeypatch,
-            {"command": "python3",
-             "args": ["-X", "dev", "-W", "ignore", "-m", "kiro_crew.apps.x"]},
+            tmp_path,
+            app_env,
+            monkeypatch,
+            {"command": "python3", "args": ["-X", "dev", "-W", "ignore", "-m", "kiro_crew.apps.x"]},
             setup=_fake_venv_python,
         )
         assert entry["command"] == sys.executable
 
-    def test_an_attached_module_spelling_triggers_the_pin(
-        self, tmp_path, app_env, monkeypatch
-    ):
+    def test_an_attached_module_spelling_triggers_the_pin(self, tmp_path, app_env, monkeypatch):
         # CPython accepts -mMODULE in one token.
         import sys
 
@@ -1563,9 +1564,7 @@ class TestStdioInterpreterResolution:
         )
         assert entry["command"] == sys.executable
 
-    def test_a_dash_c_program_never_triggers_the_pin(
-        self, tmp_path, app_env, monkeypatch
-    ):
+    def test_a_dash_c_program_never_triggers_the_pin(self, tmp_path, app_env, monkeypatch):
         # -c consumes the rest as an inline program; an -m after it belongs to
         # that program's argv, not to CPython. The attached spelling
         # (-cPROGRAM) followed directly by dash tokens is the case where only
@@ -1664,9 +1663,7 @@ class TestStdioInterpreterResolution:
                 {"command": missing, "args": []},
             )
         assert entry["command"] == missing
-        warning = "\n".join(
-            r.getMessage() for r in caplog.records if r.levelname == "WARNING"
-        )
+        warning = "\n".join(r.getMessage() for r in caplog.records if r.levelname == "WARNING")
         assert "test-app" in warning
         assert "srv" in warning
         # The message renders the command with %r, so Windows backslashes appear
@@ -1730,9 +1727,7 @@ class TestStdioInterpreterResolution:
             )
         assert "resolves to no existing executable" not in caplog.text
 
-    def test_one_bad_server_does_not_block_its_siblings(
-        self, tmp_path, app_env, monkeypatch
-    ):
+    def test_one_bad_server_does_not_block_its_siblings(self, tmp_path, app_env, monkeypatch):
         import kiro_crew.apps.bridges as bmod
 
         mcp_path = tmp_path / "mcp.json"
@@ -1795,11 +1790,7 @@ class TestBackendSharesTheInterpreterPolicy:
 
         def historical(root: Path) -> str:
             venv_python = str(root / ".venv" / "bin" / "python3")
-            return (
-                venv_python
-                if (root / ".venv" / "bin" / "python3").is_file()
-                else sys.executable
-            )
+            return venv_python if (root / ".venv" / "bin" / "python3").is_file() else sys.executable
 
         with_venv = tmp_path / "with-venv"
         _fake_venv_python(with_venv)
@@ -1823,6 +1814,189 @@ class TestBackendSharesTheInterpreterPolicy:
         assert '".venv" / "bin" / "python3").is_file()' not in source, (
             "backend.py grew back an inline copy of the interpreter policy"
         )
+
+
+class TestStdioDepsDirExposure:
+    """The provisioned deps dir (pip --target) must reach stdio MCP servers the
+    same way it reaches the backend spawn: via PYTHONPATH. A --target install
+    carries no interpreter, so the env is the only bridge — without it a
+    python-launcher server or a deps-provided console script dies on import."""
+
+    def test_the_deps_dir_is_prepended_to_a_stdio_server_pythonpath(self, tmp_path):
+        from kiro_crew.apps.bridges import resolve_stdio_command
+        from kiro_crew.apps.interpreter import app_deps_dir
+
+        app_deps_dir(tmp_path).mkdir(parents=True)
+        (tmp_path / "requirements.txt").write_bytes(b"requests\n")
+        cfg = resolve_stdio_command(
+            {"command": "python3", "args": ["server.py"], "env": {"PYTHONPATH": "/manifest/own"}},
+            app_root=tmp_path,
+        )
+        parts = cfg["env"]["PYTHONPATH"].split(os.pathsep)
+        assert parts[0] == str(app_deps_dir(tmp_path)), cfg
+        assert "/manifest/own" in parts, cfg
+
+    def test_no_deps_dir_leaves_the_manifest_env_untouched(self, tmp_path):
+        from kiro_crew.apps.bridges import resolve_stdio_command
+
+        cfg = resolve_stdio_command(
+            {"command": "python3", "args": ["server.py"]}, app_root=tmp_path
+        )
+        assert "env" not in cfg, cfg
+
+    def test_a_python_launcher_with_deps_routes_through_the_shim(self, tmp_path):
+        """PYTHONPATH never processes .pth files, so a python-launcher stdio
+        server with provisioned deps launches via deps_boot (addsitedir).
+        An interpreter OPTION first-token is left unshimmed (it would be
+        misread as the target) and falls back to the PYTHONPATH transport."""
+        import sys as _sys
+
+        from kiro_crew.apps.bridges import resolve_stdio_command
+        from kiro_crew.apps.interpreter import app_deps_dir
+
+        app_deps_dir(tmp_path).mkdir(parents=True)
+        (tmp_path / "requirements.txt").write_bytes(b"requests\n")
+        cfg = resolve_stdio_command(
+            {"command": "python3", "args": ["server.py"]}, app_root=tmp_path
+        )
+        assert cfg["command"] == _sys.executable
+        assert cfg["args"][:3] == [
+            "-m",
+            "kiro_crew.apps.deps_boot",
+            str(app_deps_dir(tmp_path)),
+        ], cfg
+        assert cfg["args"][3] == "server.py", cfg
+        # interpreter options are WALKED: -u stays consumed by the
+        # interpreter, the shim triple lands at the target token
+        cfg2 = resolve_stdio_command(
+            {"command": "python3", "args": ["-u", "server.py"]}, app_root=tmp_path
+        )
+        assert cfg2["args"][:4] == [
+            "-u",
+            "-m",
+            "kiro_crew.apps.deps_boot",
+            str(app_deps_dir(tmp_path)),
+        ], cfg2
+        assert cfg2["args"][4] == "server.py", cfg2
+        # unshimmable shapes (-c) keep the PYTHONPATH transport
+        cfg3 = resolve_stdio_command(
+            {"command": "python3", "args": ["-c", "import server"]}, app_root=tmp_path
+        )
+        assert "deps_boot" not in " ".join(cfg3["args"]), cfg3
+        assert cfg3["env"]["PYTHONPATH"].startswith(str(app_deps_dir(tmp_path))), cfg3
+        # attached -mMODULE is CPython-equivalent to the separate form and is
+        # normalized so it still gets .pth processing through the shim
+        cfg4 = resolve_stdio_command(
+            {"command": "python3", "args": ["-mserver"]}, app_root=tmp_path
+        )
+        assert cfg4["args"] == [
+            "-m",
+            "kiro_crew.apps.deps_boot",
+            str(app_deps_dir(tmp_path)),
+            "-m",
+            "server",
+        ], cfg4
+
+    def test_a_stale_deps_tree_without_requirements_is_ignored(self, tmp_path):
+        """data/ survives updates, so an update that REMOVES requirements.txt
+        leaves the provisioned tree behind — a stale tree must neither
+        inject removed dependency code nor route through the shim."""
+        from kiro_crew.apps.bridges import resolve_stdio_command
+        from kiro_crew.apps.interpreter import app_deps_dir
+
+        app_deps_dir(tmp_path).mkdir(parents=True)  # tree present, no requirements.txt
+        cfg = resolve_stdio_command(
+            {"command": "python3", "args": ["server.py"]}, app_root=tmp_path
+        )
+        assert "env" not in cfg, cfg
+        assert "deps_boot" not in " ".join(cfg.get("args") or []), cfg
+
+    def test_expected_provisioning_emits_the_deps_path_before_the_dir_exists(self, tmp_path):
+        """First enable registers the MCP config BEFORE the backend spawn
+        provisions the deps dir, and no reconciliation pass is guaranteed to
+        rewrite it. A requirements.txt makes provisioning expected, so the
+        deps path is emitted up front — a missing PYTHONPATH entry is inert
+        to Python, while omitting it strands the first registration without
+        its dependencies."""
+        from kiro_crew.apps.bridges import resolve_stdio_command
+        from kiro_crew.apps.interpreter import app_deps_dir
+
+        (tmp_path / "requirements.txt").write_bytes(b"requests\n")
+        cfg = resolve_stdio_command(
+            {"command": "python3", "args": ["server.py"]}, app_root=tmp_path
+        )
+        parts = cfg["env"]["PYTHONPATH"].split(os.pathsep)
+        assert parts[0] == str(app_deps_dir(tmp_path)), cfg
+
+    def test_a_path_based_command_still_gets_the_deps_pythonpath(self, tmp_path):
+        """A command carrying a path separator is deliberately never rewritten
+        to another interpreter — but its server still imports the app's
+        requirements, so the deps merge must run BEFORE the path early
+        return. Skipping it launches the server without its provisioned
+        dependencies and it dies on import."""
+        from kiro_crew.apps.bridges import resolve_stdio_command
+        from kiro_crew.apps.interpreter import app_deps_dir
+
+        app_deps_dir(tmp_path).mkdir(parents=True)
+        (tmp_path / "requirements.txt").write_bytes(b"requests\n")
+        cmd = os.path.join(".venv", "bin", "python")
+        cfg = resolve_stdio_command({"command": cmd, "args": ["server.py"]}, app_root=tmp_path)
+        assert cfg["command"] == cmd, cfg  # path commands are never rewritten
+        parts = cfg["env"]["PYTHONPATH"].split(os.pathsep)
+        assert parts[0] == str(app_deps_dir(tmp_path)), cfg
+
+    def test_a_path_based_gateway_module_server_gets_no_deps_env(self, tmp_path):
+        """The gateway-module exclusion survives the hoist: even a path-based
+        command whose args launch a kiro_crew module must not see the app
+        deps dir on PYTHONPATH."""
+        from kiro_crew.apps.bridges import resolve_stdio_command
+        from kiro_crew.apps.interpreter import app_deps_dir
+
+        app_deps_dir(tmp_path).mkdir(parents=True)
+        cfg = resolve_stdio_command(
+            {
+                "command": os.path.join("bin", "python3"),
+                "args": ["-m", "kiro_crew.apps.builtins.x"],
+            },
+            app_root=tmp_path,
+        )
+        assert "env" not in cfg, cfg
+
+    def test_a_gateway_module_server_never_gets_the_deps_pythonpath(self, tmp_path):
+        """An app that pip-pins its own kiro_crew copy must not shadow the
+        gateway's code: a `-m kiro_crew...` server runs the gateway's OWN
+        module on the gateway's interpreter, so the app deps dir stays out of
+        its PYTHONPATH entirely."""
+        import sys as _sys
+
+        from kiro_crew.apps.bridges import resolve_stdio_command
+        from kiro_crew.apps.interpreter import app_deps_dir
+
+        app_deps_dir(tmp_path).mkdir(parents=True)
+        cfg = resolve_stdio_command(
+            {"command": "python3", "args": ["-m", "kiro_crew.apps.builtins.x"]},
+            app_root=tmp_path,
+        )
+        assert cfg["command"] == _sys.executable
+        assert "env" not in cfg, cfg
+
+    def test_a_deps_dir_console_script_is_rewritten_and_gets_the_env(self, tmp_path):
+        from kiro_crew.apps.bridges import resolve_stdio_command
+        from kiro_crew.apps.interpreter import app_deps_dir
+
+        scripts = "Scripts" if platform_compat.IS_WINDOWS else "bin"
+        name = "my-mcp-server.exe" if platform_compat.IS_WINDOWS else "my-mcp-server"
+        script = app_deps_dir(tmp_path) / scripts / name
+        script.parent.mkdir(parents=True)
+        (tmp_path / "requirements.txt").write_bytes(b"requests\n")
+        script.write_text("#!/bin/sh\n")
+        script.chmod(0o755)
+        cfg = resolve_stdio_command({"command": "my-mcp-server"}, app_root=tmp_path)
+        assert cfg["command"] == str(script), cfg
+        # The script's shebang is the INSTALLING interpreter (sys.executable),
+        # which sees the script's own package only through this env.
+        parts = cfg["env"]["PYTHONPATH"].split(os.pathsep)
+        assert parts[0] == str(app_deps_dir(tmp_path)), cfg
 
 
 # ---------------------------------------------------------------------------
@@ -2337,9 +2511,7 @@ class TestCronServiceBridge:
             skip_dates=["2026-12-25"],
         )
 
-    def test_cron_without_timezone_passes_the_empty_sentinel(
-        self, tmp_path, app_env, monkeypatch
-    ):
+    def test_cron_without_timezone_passes_the_empty_sentinel(self, tmp_path, app_env, monkeypatch):
         """A def that names no zone keeps today's config-then-UTC fallback."""
         from unittest.mock import MagicMock, patch
 
@@ -3774,13 +3946,9 @@ class TestRefreshAppAgentsReportsIoFailures:
         # Rewriting a revoked app's agents would make them dispatchable again.
         import kiro_crew.apps.bridges as brmod
         self._wire(monkeypatch, brmod, tmp_path)
-        monkeypatch.setattr(
-            brmod, "_registration_denied", lambda name, action, app_root: "revoked"
-        )
+        monkeypatch.setattr(brmod, "_registration_denied", lambda name, action, app_root: "revoked")
         scrubbed: list[str] = []
-        monkeypatch.setattr(
-            brmod, "_deregister_agents", lambda name: scrubbed.append(name)
-        )
+        monkeypatch.setattr(brmod, "_deregister_agents", lambda name: scrubbed.append(name))
         monkeypatch.setattr(
             brmod, "_register_agents",
             lambda *a, **k: pytest.fail("must not re-register a denied app"),
@@ -3800,9 +3968,7 @@ class TestDemotionKeepsBackendIndependentServers:
     reason that had nothing to do with them.
     """
 
-    def test_the_unhealthy_reconcile_scrubs_http_and_keeps_stdio(
-        self, monkeypatch, tmp_path
-    ):
+    def test_the_unhealthy_reconcile_scrubs_http_and_keeps_stdio(self, monkeypatch, tmp_path):
         import kiro_crew.apps.backend as bmod
         import kiro_crew.apps.bridges as brmod
 
@@ -3817,8 +3983,7 @@ class TestDemotionKeepsBackendIndependentServers:
             calls["app"] = app_name
             return ["app:stdio-tool"]  # the stdio entry survives
         monkeypatch.setattr(brmod, "scrub_backend_mcp_url", _scrub)
-        monkeypatch.setattr(brmod, "refresh_app_agents",
-                            lambda name, io_failures=None: [])
+        monkeypatch.setattr(brmod, "refresh_app_agents", lambda name, io_failures=None: [])
 
         def _blanket(name):
             raise AssertionError("must not blanket-deregister on a health demotion")
@@ -3908,7 +4073,8 @@ class TestLifecycleWritersShareTheHealthSerialization:
         import kiro_crew.apps.bridges as brmod
         held: list[bool] = []
         monkeypatch.setattr(
-            brmod, "_read_mcp_json_unlocked",
+            brmod,
+            "_read_mcp_json_unlocked",
             lambda strict=False: (held.append(self._lock_held()), {"mcpServers": {}})[1],
         )
         monkeypatch.setattr(brmod, "_write_mcp_json_unlocked", lambda data: None)
@@ -3916,16 +4082,15 @@ class TestLifecycleWritersShareTheHealthSerialization:
         # A non-empty manifest: the function returns before the lock when there is
         # nothing to register, so an empty one would pass this test vacuously.
         monkeypatch.setattr(brmod, "strip_ungoverned_auto_approve", lambda m: m)
-        brmod._register_mcp_servers(
-            "app", SimpleNamespace(mcpServers={"srv": {"command": "x"}})
-        )
+        brmod._register_mcp_servers("app", SimpleNamespace(mcpServers={"srv": {"command": "x"}}))
         assert held == [True]
 
     def test_mcp_deregistration_runs_under_the_guard(self, monkeypatch):
         import kiro_crew.apps.bridges as brmod
         held: list[bool] = []
         monkeypatch.setattr(
-            brmod, "_read_mcp_json_unlocked",
+            brmod,
+            "_read_mcp_json_unlocked",
             lambda strict=False: (held.append(self._lock_held()), {"mcpServers": {}})[1],
         )
         monkeypatch.setattr(brmod, "_write_mcp_json_unlocked", lambda data: None)
@@ -3996,6 +4161,7 @@ class TestRenderFailureIsClassifiedByCause:
 
     def test_invalid_rendered_json_is_not_collected(self, monkeypatch, tmp_path):
         import kiro_crew.apps.bridges as brmod
+
         src = self._template(tmp_path, '{"name": "a", "root": "{ENGINE_ROOT}"')  # unbalanced
         monkeypatch.setattr(brmod, "_placeholder_values", lambda n: {"{ENGINE_ROOT}": "/x"})
 
@@ -4048,9 +4214,7 @@ class TestScrubNeverDeletesMaterializedAgents:
 
         monkeypatch.setattr(brmod, "_registration_source", lambda n: (None, brmod.Path(".")))
         removed: list[str] = []
-        monkeypatch.setattr(
-            brmod, "_deregister_mcp_servers", lambda n: (removed.append(n), 1)[1]
-        )
+        monkeypatch.setattr(brmod, "_deregister_mcp_servers", lambda n: (removed.append(n), 1)[1])
         monkeypatch.setattr(brmod, "_deregister_agents", lambda n: 0)
 
         brmod.scrub_backend_mcp_url("gone")
@@ -4070,9 +4234,7 @@ class TestUnreadableManifestIsNotASilentRegistration:
         import kiro_crew.apps.bridges as brmod
 
         monkeypatch.setattr(brmod, "_registration_source", lambda n: (None, brmod.Path(".")))
-        monkeypatch.setattr(
-            brmod, "_registration_denied", lambda name, action, app_root: None
-        )
+        monkeypatch.setattr(brmod, "_registration_denied", lambda name, action, app_root: None)
 
         collected: list[str] = []
         assert brmod.reregister_app_mcp_servers("app", io_failures=collected) == []
@@ -4086,9 +4248,7 @@ class TestUnreadableManifestIsNotASilentRegistration:
             brmod, "_registration_source",
             lambda n: (SimpleNamespace(mcpServers={}, agents=[]), brmod.Path(".")),
         )
-        monkeypatch.setattr(
-            brmod, "_registration_denied", lambda name, action, app_root: None
-        )
+        monkeypatch.setattr(brmod, "_registration_denied", lambda name, action, app_root: None)
 
         collected: list[str] = []
         assert brmod.reregister_app_mcp_servers("app", io_failures=collected) == []
@@ -4109,12 +4269,8 @@ class TestScrubDoesNotRematerializeAgents:
         import kiro_crew.apps.bridges as brmod
 
         manifest = SimpleNamespace(mcpServers={"srv": {"command": "x"}}, agents=["a.json"])
-        monkeypatch.setattr(
-            brmod, "_registration_source", lambda n: (manifest, brmod.Path("."))
-        )
-        monkeypatch.setattr(
-            brmod, "_registration_denied", lambda name, action, app_root: None
-        )
+        monkeypatch.setattr(brmod, "_registration_source", lambda n: (manifest, brmod.Path(".")))
+        monkeypatch.setattr(brmod, "_registration_denied", lambda name, action, app_root: None)
         monkeypatch.setattr(
             brmod, "_register_mcp_servers",
             lambda name, m, live_port=None: ["app:srv"],
@@ -4132,16 +4288,10 @@ class TestScrubDoesNotRematerializeAgents:
         import kiro_crew.apps.bridges as brmod
 
         manifest = SimpleNamespace(mcpServers={"srv": {"command": "x"}}, agents=[])
-        monkeypatch.setattr(
-            brmod, "_registration_source", lambda n: (manifest, brmod.Path("."))
-        )
-        monkeypatch.setattr(
-            brmod, "_registration_denied", lambda name, action, app_root: "revoked"
-        )
+        monkeypatch.setattr(brmod, "_registration_source", lambda n: (manifest, brmod.Path(".")))
+        monkeypatch.setattr(brmod, "_registration_denied", lambda name, action, app_root: "revoked")
         removed: list[str] = []
-        monkeypatch.setattr(
-            brmod, "_deregister_mcp_servers", lambda n: (removed.append(n), 1)[1]
-        )
+        monkeypatch.setattr(brmod, "_deregister_mcp_servers", lambda n: (removed.append(n), 1)[1])
         monkeypatch.setattr(
             brmod, "_register_mcp_servers",
             lambda *a, **k: pytest.fail("a denied app must not keep any server"),

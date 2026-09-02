@@ -309,6 +309,55 @@ class TestUninstall:
         # App files removed
         assert not (app_home / "apps" / "test-app" / APP_MANIFEST_FILENAME).exists()
 
+    def test_uninstall_purges_generated_deps_from_preserved_data(self, tmp_path, app_home):
+        """data/ preservation exists for USER data. The gateway-generated
+        dependency trees must not survive an uninstall: a compromised app
+        could plant code there (sitecustomize.py) and a reinstall under the
+        same name would prepend it to PYTHONPATH — revoked code executing in
+        a fresh install."""
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        data_dir = app_home / "apps" / "test-app" / "data"
+        (data_dir / "cache.json").write_text('{"key": "value"}')
+        for gen in (".kirocrew-deps", ".kirocrew-deps-staging", ".kirocrew-deps-prior"):
+            (data_dir / gen).mkdir(parents=True)
+            (data_dir / gen / "sitecustomize.py").write_text("planted = True\n")
+
+        result = uninstall_app("test-app", keep_data=True)
+        assert result.ok
+        preserved = app_home / "apps" / "test-app" / "data"
+        assert (preserved / "cache.json").is_file()  # user data kept
+        for gen in (".kirocrew-deps", ".kirocrew-deps-staging", ".kirocrew-deps-prior"):
+            assert not (preserved / gen).exists(), gen
+
+    def test_uninstall_purge_unlinks_a_planted_deps_symlink(self, tmp_path, app_home):
+        """rmtree refuses a symlink, so a malicious app could plant one at
+        the deps name and its target would ride through the purge; the purge
+        must unlink the LINK (never following it) so the reinstall starts
+        clean while the link's target elsewhere is untouched."""
+        import os as _os
+
+        if not hasattr(_os, "symlink"):
+            pytest.skip("no symlink support")
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        data_dir = app_home / "apps" / "test-app" / "data"
+        target = tmp_path / "elsewhere"
+        target.mkdir()
+        (target / "sitecustomize.py").write_text("planted = True\n")
+        try:
+            _os.symlink(target, data_dir / ".kirocrew-deps")
+        except OSError:
+            pytest.skip("symlink not permitted")
+
+        result = uninstall_app("test-app", keep_data=True)
+        assert result.ok
+        preserved = app_home / "apps" / "test-app" / "data"
+        assert not (preserved / ".kirocrew-deps").exists()
+        assert not (preserved / ".kirocrew-deps").is_symlink()
+        # the purge removed the LINK, not the linked target's content
+        assert (target / "sitecustomize.py").is_file()
+
     def test_install_preserves_existing_data(self, tmp_path, app_home):
         """Reinstall after default uninstall must preserve user data."""
         src = _make_app_source(tmp_path)
@@ -1273,6 +1322,18 @@ class TestCopyAppTree:
         (src / ".git" / "config").write_text("[core]")
         (src / "__pycache__").mkdir()
         (src / "__pycache__" / "x.pyc").write_bytes(b"\x00")
+        # The gateway's own pip --target provisioning output: machine- and
+        # platform-specific, re-provisioned at the destination on first spawn.
+        # Copying it would put a foreign wheel tree FIRST on the child's
+        # PYTHONPATH, shadowing the correctly provisioned copy. The transient
+        # staging/prior swap directories are denylisted for the same reason.
+        (src / ".kirocrew-deps").mkdir()
+        (src / ".kirocrew-deps" / "requests").mkdir()
+        (src / ".kirocrew-deps" / "requests" / "__init__.py").write_text("x = 1")
+        (src / ".kirocrew-deps-staging").mkdir()
+        (src / ".kirocrew-deps-staging" / "partial.py").write_text("x = 1")
+        (src / ".kirocrew-deps-prior").mkdir()
+        (src / ".kirocrew-deps-prior" / "old.py").write_text("x = 1")
         # A real `build/` dir is NOT denylisted: the manifest may reference
         # runtime paths anywhere under the app root, so it must survive.
         # (A `build` *symlink* is neutralized by symlinks=True instead.)
@@ -1288,6 +1349,9 @@ class TestCopyAppTree:
         assert not (dest / "ui" / "node_modules").exists()
         assert not (dest / ".git").exists()
         assert not (dest / "__pycache__").exists()
+        assert not (dest / ".kirocrew-deps").exists()
+        assert not (dest / ".kirocrew-deps-staging").exists()
+        assert not (dest / ".kirocrew-deps-prior").exists()
         assert (dest / "build" / "artifact.txt").is_file()
         assert (dest / "ui" / "dist" / "index.mjs").is_file()
 
