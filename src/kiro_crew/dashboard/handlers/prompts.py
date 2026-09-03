@@ -14,7 +14,6 @@ from typing import Any
 
 from aiohttp import web
 
-from kiro_crew import agent as _agent
 from kiro_crew import pinned_fs
 from kiro_crew.agent_discovery import agent_skill_globs
 from kiro_crew.config.loader import KiroCrewConfig
@@ -53,11 +52,15 @@ from ._shared import (
 )
 
 
-def _list_aim_prompts():
-    """Import from parent to avoid circular — cache lives in __init__.py for test compat."""
+def _list_aim_prompts(project_dir=None):
+    """Import from parent to avoid circular — cache lives in __init__.py for test compat.
+
+    ``project_dir`` is the caller's already-resolved local project (or ``None``)
+    and is forwarded unchanged so the parent implementation appends that
+    project's local prompts (see its docstring)."""
     import kiro_crew.dashboard.handlers as _pkg
 
-    return _pkg._list_aim_prompts()
+    return _pkg._list_aim_prompts(project_dir)
 
 
 logger = logging.getLogger(__name__)
@@ -65,6 +68,16 @@ logger = logging.getLogger(__name__)
 MAX_PROMPT_BYTES = 100_000  # 100 KB — public constant, imported across dashboard + gateway + tests
 _CODE_DASHBOARD_OWNER_REQUIRED = "dashboard_owner_required"
 _CODE_SLOT_NOT_FOUND = "slot_not_found"
+
+#: The literal the dashboard's browser client sends as ``X-Session-Key`` on every
+#: request that has no chat to name (``website/src/api/client.ts``). It marks the
+#: SURFACE, so it must never be read as a slot key: the slot-name split turns it
+#: into ``ui``, and a chat literally named ``ui`` is a name a user can pick — that
+#: chat's project would then drive every settings-page create, update and delete.
+#: Several handlers already refuse it by this literal (artifacts, cron,
+#: ``_shared``'s restricted-session predicates); it is spelled here rather than
+#: imported so this module owns the value it compares.
+_DASHBOARD_SURFACE_KEY = "dashboard:ui"
 
 
 def _deny_non_owner_skill_trust(request: web.Request, operation: str) -> web.Response | None:
@@ -99,6 +112,21 @@ def _deny_non_owner_skill_trust(request: web.Request, operation: str) -> web.Res
     )
 
 
+def _named_slot(state: DashboardState, session_key: str) -> Any | None:
+    """The chat slot *session_key* names, or ``None``.
+
+    The slot name is the part after the transport prefix, the same split
+    ``requesting_slot_project`` applies — shared so the app-isolation checks that
+    read the slot's owning app and that resolver can never disagree about which
+    slot a key selected.
+    """
+    slot_name = session_key.split(":", 1)[-1] if session_key else ""
+    if not slot_name:
+        return None
+    slots = getattr(state, "_slots", {}) or {}
+    return slots.get(slot_name)
+
+
 def _deny_foreign_app_skill_slot(
     request: web.Request,
     state: DashboardState,
@@ -117,8 +145,7 @@ def _deny_foreign_app_skill_slot(
     if not request_app:
         return None
     slot_name = session_key.split(":", 1)[-1] if session_key else ""
-    slots = getattr(state, "_slots", {}) or {}
-    slot = slots.get(slot_name) if slot_name else None
+    slot = _named_slot(state, session_key)
     owner = getattr(slot, "_app", "") if slot is not None else ""
     if owner == request_app and requesting_slot_project(state, session_key) is not None:
         try:
@@ -161,6 +188,102 @@ def _sel():
     return _pkg.sel()
 
 
+def _prompt_local_project(
+    request: web.Request, state: DashboardState, session_key: str
+) -> Path | None:
+    """The project whose ``.kiro/prompts`` this request's ``local`` scope names.
+
+    Every prompt surface routes "This project" through here, so create, list,
+    read, update and delete cannot disagree about where "local" is for one
+    request. ``None`` means there is no local directory for this caller, which
+    flows into the existing ``no_active_project`` contract on the write paths
+    and simply omits ``source: "local"`` entries from a listing.
+
+    Which question to ask depends on whether the request names a real chat, and
+    the two cases genuinely differ:
+
+    * A request whose ``X-Session-Key`` names an **existing slot** is speaking for
+      one chat, so it gets :func:`requesting_slot_project` — that slot's project
+      or nothing. This is the answer ``chat_runner`` reaches by reading
+      ``slot.project`` when it expands an ``@mention``, so a prompt the chat
+      surface will match is exactly the one this surface offers, and a chat with
+      no project of its own is told so rather than shown a neighbour's checkout.
+    * A request that names **no slot** is a global surface, and gets
+      :func:`active_project_dir`'s fallback: the single project every open slot
+      shares. That fallback is load-bearing, not laxity — the only surfaces that
+      offer this scope (the overview Prompts tab and the command palette) sit
+      outside any chat and have nothing to name, so the strict resolver would
+      answer ``None`` for every request they can make and "This project" would be
+      permanently dead there. Two chats on different projects still resolve
+      ``None``: a settings page has no defensible answer then, and guessing would
+      create, overwrite or delete in the wrong checkout.
+
+    An **app** request gets no fallback and no foreign slot. App-token grants
+    are path-only, so an app permitted to READ ``/api/prompts`` could otherwise
+    name any slot in a forged ``X-Session-Key`` and use another slot's project
+    as a prompt-content oracle; the shared-project fallback would hand it one
+    without even a header. It resolves strictly per-slot and only for a slot it
+    owns, so a mismatch narrows the answer to ``None`` — the app keeps the
+    package SOPs and global prompts its grant already covered, and gains no
+    local ones. Narrowing rather than refusing is deliberate: the endpoint's
+    other content is not slot-scoped, so a 404 would withdraw a capability the
+    grant does cover. Both outcomes are SEL-audited under one
+    ``operation``/``source`` pair, so an app request leaves exactly one
+    attributable line whether the selection was granted or refused — a forged key
+    is visible, and so is which project a granted selection actually served.
+
+    The ``dashboard:ui`` placeholder is folded to "no key" before any of that.
+    It is what the browser sends when it has no chat to name, and the slot-name
+    split would otherwise turn it into ``ui`` — so a user whose own chat is named
+    ``ui`` would have that chat's checkout selected by every settings-page
+    request, and a create, update or delete aimed at "This project" would land in
+    it. Folded, those requests take the slotless path they belong on.
+    """
+    if session_key == _DASHBOARD_SURFACE_KEY:
+        session_key = ""
+    request_app = request.get("app", "")
+    slot = _named_slot(state, session_key)
+    if not request_app:
+        if slot is not None:
+            return requesting_slot_project(state, session_key)
+        # No slot named, so active_project_dir's step 1 cannot fire either; what
+        # is wanted from it here is only the shared-project step.
+        return active_project_dir(state, session_key)
+    slot_name = session_key.split(":", 1)[-1] if session_key else ""
+    if slot is not None and getattr(slot, "_app", "") == request_app:
+        # Audit the GRANT, not only the refusal. The ownership test is the whole
+        # authorization for an app reading another principal's checkout through
+        # this endpoint, so a log carrying only refusals cannot answer which
+        # project an app was actually served — the reconstruction an operator
+        # needs after a compromised app, where every selection succeeded. Same
+        # operation/source as the denial below, so one app request leaves exactly
+        # one attributable line either way; same shape as
+        # ``_deny_foreign_app_skill_slot``'s allowed event on the skills surface.
+        try:
+            _sel().log_api_access(
+                caller=request_app,
+                operation="prompt_local_project",
+                outcome="allowed",
+                source="app_isolation",
+                resources=f"slot={slot_name}",
+            )
+        except Exception:  # noqa: BLE001 — preserve authorized access if SEL is unwritable
+            logger.debug("Could not audit allowed app prompt-slot selection", exc_info=True)
+        return requesting_slot_project(state, session_key)
+    try:
+        _sel().log_api_access(
+            caller=request_app,
+            operation="prompt_local_project",
+            outcome="denied",
+            source="app_isolation",
+            resources=f"slot={slot_name}",
+            error="slot not found" if slot is None else "app does not own this slot",
+        )
+    except Exception:  # noqa: BLE001 — a narrowed answer must survive an unwritable SEL
+        logger.debug("Could not audit denied app prompt-slot selection", exc_info=True)
+    return None
+
+
 # ── Prompts (Agent SOPs) ──
 
 
@@ -191,10 +314,13 @@ def _description_from_text(text: str) -> str:
 
 
 def _extract_sop_description(path: Path) -> str:
-    """Description for a path the caller has NOT already read — the listing walk.
+    """Description for a path the caller has NOT already read — the PACKAGE SOP walk.
 
-    The scoped detail read must use :func:`_description_from_text` instead, on
-    the bytes its read gate validated.
+    A user-prompt entry must use :func:`_gated_sop_description` instead, and the
+    scoped detail read :func:`_description_from_text` on the bytes its read gate
+    validated. This one opens by name, which re-resolves the path, so it is only
+    for roots the platform seam supplies rather than a directory a checkout can
+    write.
     """
     # Strict decode: a file that is not UTF-8 has no description we can trust,
     # and replacement characters would put mojibake in the list.
@@ -202,6 +328,139 @@ def _extract_sop_description(path: Path) -> str:
         return _description_from_text(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError):
         return ""
+
+
+def _prompt_read_root(entry: dict[str, Any], project_dir: Path | None) -> Path | None:
+    """The prompt root an *entry*'s read may be pinned inside, or ``None``.
+
+    Handed to ``safe_read_file_bytes_nolink`` as ``within_root``, which requires
+    the OPENED descriptor's real path to resolve inside it. That closes what
+    ``O_NOFOLLOW`` cannot: the flag guards only the final component, so an
+    ANCESTOR directory swapped for a link would redirect the read out of the
+    prompt tree with the leaf still looking ordinary.
+
+    Answered only when the entry POSITIVELY names one of the two user scopes,
+    whose root the minting gate already validated it against. A package SOP's
+    roots are plural and come from the platform seam, so it keeps the containment
+    its own provider gave it rather than a single root guessed here — which would
+    newly refuse legitimate edition-contributed SOPs. An entry shape naming
+    neither scope falls back to the same treatment rather than to a wrong root,
+    so an unfamiliar producer loses no capability; either way the read still gets
+    ``O_NOFOLLOW`` and the hardlink check.
+
+    Shared by every reader of a prompt entry — the chat ``@mention`` expansion and
+    both HTTP detail branches — so no two of them can disagree about which root
+    pins a given entry.
+    """
+    if entry.get("package"):
+        return None
+    source = entry.get("source")
+    if source == "local":
+        return project_dir / ".kiro" / "prompts" if project_dir else None
+    if source == "global":
+        return Path.home() / ".kiro" / "prompts"
+    return None
+
+
+def _gated_sop_description(path: Path, prompts_dir: Path) -> str:
+    """Description for a user-prompt entry, read through the no-link gate.
+
+    :func:`_extract_sop_description` opens the path BY NAME, which re-resolves it.
+    An entry swapped for a symlink between the minting gate's ``lstat`` and that
+    open therefore gets its TARGET's first heading — or its ``description``
+    frontmatter — published in the listing, for a file every read verb on this API
+    refuses. A project's ``.kiro/prompts`` is content the user cloned rather than
+    authored, so that swap is a shape the directory's author can arrange.
+
+    The gate opens first with ``O_NOFOLLOW`` and validates the descriptor it
+    actually read, and ``within_root`` pins the opened inode inside the prompt
+    directory the entry was gated against, so the inode described is the inode
+    approved. The scoped read derives its own description from validated bytes for
+    exactly this reason.
+
+    A refusal, an unreadable file, or one past the read cap yields an EMPTY
+    description rather than a refusal to name the file: the entry's contract is
+    that a bad mode or a transient I/O error surfaces as the read path's own error
+    instead of a prompt silently vanishing from the user's library. Strict decode,
+    so a file that is not UTF-8 yields no description rather than mojibake.
+    """
+    try:
+        raw = safe_read_file_bytes_nolink(
+            str(path), within_root=str(prompts_dir), max_bytes=MAX_PROMPT_BYTES
+        )
+    except FileTooLargeError:
+        return ""
+    if raw is None:
+        return ""
+    try:
+        return _description_from_text(raw.decode("utf-8"))
+    except UnicodeDecodeError:
+        return ""
+
+
+def _local_prompt_entry(name: str, project_dir: Path | None) -> dict[str, Any] | None:
+    """The single local prompt *name* can select, by exact stem — one open, not a listing.
+
+    ``_find_prompt`` is reached once per turn that starts with ``@``, so resolving
+    "local" by listing ``<project>/.kiro/prompts`` the way the prompts tab does
+    would put a ``read_text`` per file — a description extraction for every prompt
+    in the directory — on that turn, in a directory the gateway does not own and
+    that may be network-backed. Being off the event loop bounds the blast radius
+    of a slow read to the one turn; it does not make the read free. A local
+    entry's ``name`` and ``fullName`` are both the
+    file stem, so exactly one entry in that directory can ever match: find that
+    one entry and gate it. The cost is then O(1) in the number of prompts the
+    project keeps there rather than linear in it: the root gate's ``lstat`` and
+    two ``resolve``s, one ``getdents``, the entry gate's own stats, and — only on
+    a HIT — one ``read_text`` of the matched file for its description. The
+    caller reads that same file again for the body it substitutes, so a resolved
+    ``@mention`` opens the matched prompt twice; a MISS opens nothing.
+
+    The candidate path is built from the **directory's own** entry name, never by
+    joining *name* onto the prompt root. The two spellings would open the same
+    inode — ``_plain_stem_ok`` runs first and rejects a separator, a ``..`` and a
+    dotfile, so a joined name could not leave the directory either — but only the
+    enumerated form makes that unconditional rather than a property of the
+    predicate, and it is what lets a path-traversal analysis see it. ``@sub/foo``
+    and ``@../escape`` are therefore misses that never reach the filesystem at
+    all. ``os.scandir`` needs no ``stat`` to answer a name, so the comparison
+    costs one ``getdents`` regardless of directory size.
+
+    The ROOT is gated by ``_resolve_prompt_dir`` and the ENTRY by the parent
+    package's ``_prompt_dir_entry`` — the same two gates the listing scan and
+    every serving verb use, in the same order, so a name resolved here and a name
+    resolved by the scan are refused on identical grounds. That includes
+    ``_prompt_dir_entry``'s ``RuntimeError`` catch, since a symlink loop is
+    exactly the kind of entry an untrusted checkout ships.
+    """
+    if project_dir is None or not _plain_stem_ok(name):
+        return None
+    import kiro_crew.dashboard.handlers as _pkg
+
+    # Same root gate as the scoped read, both write verbs and the listing scan:
+    # a prompt root the REPOSITORY redirected out of the project names files the
+    # user never authored, and _prompt_dir_entry cannot see that — it compares an
+    # entry against the directory it was found in, and a redirected directory
+    # makes everything inside it look confined. Its lstat plus two resolves are
+    # the only filesystem work this adds, and they are O(1) in directory size.
+    prompts_dir, root_err = _resolve_prompt_dir("local", Path(project_dir))
+    if prompts_dir is None or root_err is not None:
+        return None
+    target = f"{name}.md"
+    try:
+        with os.scandir(prompts_dir) as entries:
+            for entry in entries:
+                if entry.name == target:
+                    return _pkg._prompt_dir_entry(prompts_dir / entry.name, prompts_dir, "local")
+    except (OSError, ValueError, RuntimeError):
+        # A missing or unreadable prompt root is a miss, never an unaudited 500
+        # (a link-redirected one is already refused above). A name carrying an
+        # embedded NUL (``%00`` in the URL
+        # path) needs no case of its own: it is compared against directory entry
+        # names rather than joined into a path, and no real entry name can hold
+        # one, so it simply does not match.
+        return None
+    return None
 
 
 def _redact_prompt(p: dict[str, Any]) -> None:
@@ -218,8 +477,17 @@ async def api_prompts(request: web.Request) -> web.Response:
     # work that can stall the event loop on a large tree. It has a 5s TTL cache,
     # but the cold/expired build must run off the loop. (The cache lives in the
     # parent package; the executor call still benefits from it on warm builds.)
+    # Resolve the local project on the loop (_prompt_local_project only reads
+    # state._slots, non-blocking) and capture it into the executor job, so
+    # "local" entries come from the requester's own checkout rather than the
+    # process-wide KIROCREW_PROJECT_DIR — which on a source install names the
+    # Kiro Crew tree itself and on a wheel install names nothing, so a prompt
+    # the user authored in their project was never listed here (#7345).
+    state: DashboardState = request.app["state"]
+    session_key = _read_session_key(request)
+    project_dir = _prompt_local_project(request, state, session_key)
     prompts = await asyncio.get_running_loop().run_in_executor(
-        discovery_executor(), _list_aim_prompts
+        discovery_executor(), functools.partial(_list_aim_prompts, project_dir)
     )
     home = str(Path.home())
     for p in prompts:
@@ -237,8 +505,21 @@ async def api_prompts(request: web.Request) -> web.Response:
     return web.json_response(prompts)
 
 
-def _find_prompt(raw_name: str) -> dict[str, Any] | None:
-    """Resolve a prompt by bare name, fullName, or ``package/name``."""
+def _find_prompt(raw_name: str, project_dir=None) -> dict[str, Any] | None:
+    """Resolve a prompt by bare name, fullName, or ``package/name``.
+
+    ``project_dir`` is the caller's already-resolved local project (or ``None``).
+    The project-independent half (package SOPs + global user prompts) is searched
+    by list, under the 5s cache; the local half is resolved by exact name through
+    :func:`_local_prompt_entry`, which costs one directory read and one open
+    instead of a description read per prompt in the directory. Ordering
+    is preserved either way — the project-independent half wins a stem collision,
+    exactly as it did when both halves were one list — and this is what keeps the
+    per-turn ``@mention`` path free of an unbounded, uncacheable directory walk.
+
+    A ``package/name`` spelling can only ever name a package SOP (a user prompt's
+    ``package`` is ``""``), so it skips the local lookup rather than probing the
+    project for a path it could not return."""
     pkg_filter = ""
     name = raw_name
     if "/" in raw_name:
@@ -248,7 +529,9 @@ def _find_prompt(raw_name: str) -> dict[str, Any] | None:
             continue
         if p["name"] == name or p["fullName"] == name:
             return p
-    return None
+    if pkg_filter:
+        return None
+    return _local_prompt_entry(name, project_dir)
 
 
 async def api_prompt_detail(request: web.Request) -> web.Response:
@@ -268,11 +551,77 @@ async def api_prompt_detail(request: web.Request) -> web.Response:
     scope = request.query.get("scope", "")
     if scope in _PROMPT_SCOPES:
         return await _api_user_prompt_detail(request, raw, scope)
-    # _find_prompt() → _list_aim_prompts() does an rglob('*.sop.md') walk over the
-    # (possibly large / edition-provided) prompt roots on a cold/expired cache;
-    # offload it so a slow FS can't stall the event loop.
-    p = await asyncio.get_running_loop().run_in_executor(discovery_executor(), _find_prompt, raw)
-    if not p:
+    # Resolve the local project on the loop first and capture it into the executor
+    # job below, through the same _prompt_local_project seam the lister uses, so an
+    # unscoped lookup can only match a local prompt the same request would have
+    # been shown. That resolver reads state._slots and nothing else, so it is the
+    # one step here that may stay on the loop.
+    state: DashboardState = request.app["state"]
+    session_key = _read_session_key(request)
+    project_dir = _prompt_local_project(request, state, session_key)
+
+    def _resolve_and_read() -> tuple[dict[str, Any] | None, str, str]:
+        """Resolve the name AND read the matched file, in one executor job.
+
+        Returns ``(entry, content, error_token)``, where an empty token means the
+        read succeeded. Every step is filesystem work — the resolution's
+        ``rglob('*.sop.md')`` walk over the (possibly large, edition-provided)
+        package roots on a cold/expired cache, the sensitive-path gate's
+        ``resolve``, the size ``stat``, and the body ``read_text`` — so they share
+        ONE job rather than handing the metadata back and finishing on the loop.
+        Which matters because a match no longer only ever names a package root or
+        the gateway's own ``~/.kiro/prompts``: it can name
+        ``<project>/.kiro/prompts``, a directory the gateway does not own and that
+        may be network-backed, so a ``stat`` and a read left on the loop would
+        stall every other request and the heartbeat on exactly the storage this
+        endpoint newly reaches. ``_api_user_prompt_detail``'s ``_read`` is one job
+        for the same reason.
+        """
+        p = _find_prompt(raw, project_dir)
+        if not p:
+            return None, "", "not_found"
+        from kiro_crew.hooks import validate_file_path  # noqa: F811
+
+        # Canonicalize and refuse a sensitive target FIRST, so that refusal keeps
+        # its own coded 403 rather than being folded into the gate's single
+        # deliberately-uninformative None below.
+        resolved = validate_file_path(p["path"])
+        if resolved is None:
+            return p, "", "blocked"
+        # Read through the hardlink-rejecting gate rather than by name, the same
+        # way the scoped branch and the chat `@mention` expansion do. Canonicalizing
+        # a path and then opening THAT NAME leaves a window in which the leaf is
+        # swapped for a link, so the bytes served are not the bytes any check ran
+        # against; the gate opens first with ``O_NOFOLLOW`` and validates the
+        # descriptor it actually read, so the inode checked is the inode returned,
+        # and ``st_nlink > 1`` or a non-regular inode is refused. Every entry
+        # reaching here was minted by the listing gate, which refuses a link
+        # outright, so this closes that swap window rather than a standing hole.
+        read_root = _prompt_read_root(p, project_dir)
+        try:
+            data = safe_read_file_bytes_nolink(
+                resolved,
+                within_root=str(read_root) if read_root else None,
+                max_bytes=MAX_PROMPT_BYTES,
+            )
+        except FileTooLargeError:
+            # Its own 413, exactly as the explicit size stat this replaces gave,
+            # and as the scoped branch gives.
+            return p, "", "too_large"
+        if data is None:
+            # The gate refuses and reads through ONE descriptor, so it cannot say
+            # which of a link, a hardlink, an escaping inode or an unreadable file
+            # happened — and that is deliberate, since distinguishing them would
+            # make the endpoint an oracle for a link's target. Reported as the
+            # `file not readable` this route already answered for an unreadable
+            # file, so a refusal reveals nothing the plain case did not.
+            return p, "", "error"
+        return p, data.decode("utf-8", errors="replace"), ""
+
+    p, content, err = await asyncio.get_running_loop().run_in_executor(
+        discovery_executor(), _resolve_and_read
+    )
+    if p is None:
         _sel().log_tool_invocation(
             session_key="",
             agent="api",
@@ -284,10 +633,7 @@ async def api_prompt_detail(request: web.Request) -> web.Response:
         )
         return web.json_response({"error": "not found"}, status=404)
     name = raw.split("/", 1)[-1] if "/" in raw else raw
-    from kiro_crew.hooks import validate_file_path  # noqa: F811
-
-    resolved = validate_file_path(p["path"])
-    if resolved is None:
+    if err == "blocked":
         _sel().log_tool_invocation(
             session_key="",
             agent="api",
@@ -298,21 +644,18 @@ async def api_prompt_detail(request: web.Request) -> web.Response:
             metadata={"name": name, "path": p["path"]},
         )
         return web.json_response({"error": "access denied"}, status=403)
-    try:
-        path = Path(resolved)
-        if path.stat().st_size > MAX_PROMPT_BYTES:
-            _sel().log_tool_invocation(
-                session_key="",
-                agent="api",
-                source="dashboard",
-                tool_name="api_prompt_detail",
-                tool_kind="prompt",
-                outcome="too_large",
-                metadata={"name": name, "path": p["path"]},
-            )
-            return web.json_response({"error": "file too large"}, status=413)
-        content = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    if err == "too_large":
+        _sel().log_tool_invocation(
+            session_key="",
+            agent="api",
+            source="dashboard",
+            tool_name="api_prompt_detail",
+            tool_kind="prompt",
+            outcome="too_large",
+            metadata={"name": name, "path": p["path"]},
+        )
+        return web.json_response({"error": "file too large"}, status=413)
+    if err == "error":
         _sel().log_tool_invocation(
             session_key="",
             agent="api",
@@ -472,28 +815,35 @@ def _invalidate_prompt_cache() -> None:
     _pkg._invalidate_prompt_cache()
 
 
-def _resolve_prompt_dir(scope: str) -> tuple[Path | None, str | None]:
+def _resolve_prompt_dir(scope: str, project_dir: Path | None) -> tuple[Path | None, str | None]:
     """Resolve and validate the prompt directory for *scope*, OFF the loop.
 
     Returns ``(dir, None)`` or ``(None, error_code)``.
 
-    Both halves touch the filesystem: resolving "local" reads the active
-    project, and the link check ``lstat``s the directory. On a network-mounted
-    home or project that is a multi-second stall, so every caller runs this
-    inside its own executor job rather than on the event loop — the gateway
-    serves other requests and the heartbeat keeps ticking meanwhile.
+    ``project_dir`` is the caller's local project (or ``None``), resolved on the
+    event loop by ``_prompt_local_project`` and passed in — this executor job
+    does not resolve it itself, which is what keeps create and list agreeing on
+    where "local" is for one request. A ``None`` project for a "local" scope
+    yields ``no_active_project``, the same code a "local" scope carries whenever
+    no project can be named.
+
+    The remaining half still touches the filesystem: the link check ``lstat``s
+    the directory. On a network-mounted home or project that is a multi-second
+    stall, so every caller runs this inside its own executor job rather than on
+    the event loop — the gateway serves other requests and the heartbeat keeps
+    ticking meanwhile.
     """
-    d = _user_prompt_dir(scope)
+    d = _user_prompt_dir(scope, project_dir)
     if d is None:
         return None, "no_active_project"
     if _linked_prompt_root(d):
         return None, "linked_prompt_root"
-    if scope == "local" and not _local_prompt_dir_in_project(d):
+    if scope == "local" and not _local_prompt_dir_in_project(d, project_dir):
         return None, "linked_prompt_root"
     return d, None
 
 
-def _local_prompt_dir_in_project(d: Path) -> bool:
+def _local_prompt_dir_in_project(d: Path, project_dir: Path | None) -> bool:
     """True when the local prompt dir RESOLVES inside the resolved project root.
 
     The leaf-only rule in ``_linked_prompt_root`` tolerates ancestor links
@@ -503,29 +853,48 @@ def _local_prompt_dir_in_project(d: Path) -> bool:
     and deletes into the global prompt tree. Comparing resolved-to-resolved
     keeps legitimately-linked project roots working while refusing any chain
     that leaves the project.
+
+    ``project_dir`` is the caller's local project (or ``None``), supplied by the
+    caller rather than read from a process-wide resolver — so the containment
+    check is made against the very root the write was addressed to.
+
+    ``RuntimeError`` is caught alongside ``OSError`` because ``Path.resolve()``
+    signals a symlink LOOP that way and ``RuntimeError`` is not an ``OSError``.
+    An ANCESTOR loop reaches here undetected: ``_linked_prompt_root``'s
+    ``is_link_or_junction`` is ``os.path.islink``, which swallows the ``ELOOP``
+    and answers False, so a checkout shipping ``.kiro -> .kiro`` arrives at this
+    resolve. Both enumerating callers of this gate — the listing scan and the
+    exact-name lookup — run it outside any broad handler catch, so letting the
+    loop escape takes ``GET /api/prompts`` and the unscoped detail lookup down
+    with a 500 instead of costing one local library.
+    A loop names no directory inside the project, so it is refused like any other
+    escaping chain.
     """
-    proj = _agent._project_dir()
+    proj = project_dir
     if not proj:
         return False
     try:
         return d.resolve().is_relative_to(Path(proj).resolve())
-    except OSError:
+    except (OSError, RuntimeError):
         return False
 
 
-def _user_prompt_dir(scope: str) -> Path | None:
+def _user_prompt_dir(scope: str, project_dir: Path | None) -> Path | None:
     """Resolve the user prompt directory for *scope*.
 
-    Deliberately the same resolver ``_list_aim_prompts`` uses (the
-    gateway-global project dir): create and list must agree on where "local"
-    is, or a created prompt would never appear in the listing. Moving both
-    sides to per-chat-slot project resolution is a coordinated change to both.
+    "local" resolves against the project supplied by the caller
+    (``project_dir``), which ``_prompt_local_project`` resolved on the event loop
+    from the request's own slot context — not from the process-wide
+    ``KIROCREW_PROJECT_DIR``, which names the Kiro Crew tree on a source install
+    and nothing at all on a wheel. ``_list_aim_prompts`` is handed the SAME
+    resolved project, so create and list agree on where "local" is: a created
+    local prompt appears in the listing that same request gets, and never in a
+    listing for a different project. ``None`` resolves "local" to ``None``, which
+    flows into the existing ``no_active_project`` contract.
     """
     if scope == "global":
         return Path.home() / ".kiro" / "prompts"
-    # Called through the module rather than imported by name so that patching
-    # ``kiro_crew.agent._project_dir`` (as the tests do) is still observed here.
-    proj = _agent._project_dir()
+    proj = project_dir
     return proj / ".kiro" / "prompts" if proj else None
 
 
@@ -710,8 +1079,17 @@ async def api_prompts_create(request: web.Request) -> web.Response:
             {"error": "prompt name is too long", "code": "name_too_long"}, status=400
         )
 
+    # Resolve the local project on the event loop (_prompt_local_project only
+    # reads state._slots, non-blocking) and capture it into the executor closure
+    # below, so a "local" create lands in the requester's own checkout. It is the
+    # SAME seam the lister resolves through, which is what keeps create and list
+    # from disagreeing — a prompt created here is one the same request lists.
+    state: DashboardState = request.app["state"]
+    session_key = _read_session_key(request)
+    project_dir = _prompt_local_project(request, state, session_key)
+
     def _write() -> str | None:
-        target_dir, err = _resolve_prompt_dir(scope)
+        target_dir, err = _resolve_prompt_dir(scope, project_dir)
         if target_dir is None:
             return err
         filename = f"{safe_name}.md"
@@ -1013,11 +1391,19 @@ async def _api_user_prompt_detail(request: web.Request, name: str, scope: str) -
             {"error": "invalid prompt name", "code": "invalid_name"}, status=400
         )
 
+    # Resolve the local project on the loop and close over it so a scoped
+    # "local" read addresses the requester's own checkout — through the same
+    # _prompt_local_project seam create and list use, so the bytes the editor is
+    # seeded from are the bytes a following PUT to this scope would replace.
+    state: DashboardState = request.app["state"]
+    session_key = _read_session_key(request)
+    project_dir = _prompt_local_project(request, state, session_key)
+
     def _read() -> tuple[str | None, str, str | None, str, bool, str]:
         # Directory resolution, the link check, and description extraction all
         # touch the filesystem, so they share this one executor job rather than
         # running on the loop.
-        target_dir, derr = _resolve_prompt_dir(scope)
+        target_dir, derr = _resolve_prompt_dir(scope, project_dir)
         if target_dir is None:
             return None, "", derr, "", False, ""
         target = target_dir / f"{name}.md"
@@ -1180,6 +1566,15 @@ async def _api_prompt_write(request: web.Request) -> web.Response:
             {"error": "invalid prompt name", "code": "invalid_name"}, status=400
         )
 
+    # Resolve the local project on the loop and close over it in _apply_locked so
+    # a "local" update/delete addresses the requester's own checkout, through the
+    # same _prompt_local_project seam the scoped read used to seed the editor —
+    # the write lands in the file the read served, not in another project's copy
+    # of the same stem.
+    state: DashboardState = request.app["state"]
+    session_key = _read_session_key(request)
+    project_dir = _prompt_local_project(request, state, session_key)
+
     content: str | None = None
     base_hash: str | None = None
     if request.method == "PUT":
@@ -1244,7 +1639,7 @@ async def _api_prompt_write(request: web.Request) -> web.Response:
             return _apply_locked()
 
     def _apply_locked() -> str | None:
-        target_dir, derr = _resolve_prompt_dir(scope)
+        target_dir, derr = _resolve_prompt_dir(scope, project_dir)
         if target_dir is None:
             return derr
         target = target_dir / f"{name}.md"
