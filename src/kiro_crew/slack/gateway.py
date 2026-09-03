@@ -2490,7 +2490,9 @@ class GatewayOrchestrator:
         try:
             from kiro_crew.agent import rebuild_agent_config  # circular import
 
-            path = rebuild_agent_config()
+            # Off-loop: the rebuild is synchronous file I/O (now including the
+            # per-fork template refresh) and must not stall startup readiness.
+            path = await asyncio.to_thread(rebuild_agent_config)
             logger.info("Agent config installed: %s", path)
 
             # Deliver shim + one-time stale-MCP purge automatically — the

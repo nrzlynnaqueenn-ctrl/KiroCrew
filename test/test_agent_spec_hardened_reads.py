@@ -908,6 +908,8 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
     "kiro_crew/dashboard/handlers/agents.py": [
         ("api_agent_detail", "dashboard"),
         ("api_agent_detail", "dashboard"),
+        ("api_agent_fork", "dashboard"),
+        ("api_agent_publish", "dashboard"),
         ("api_agents_sync", "dashboard"),
     ],
     "kiro_crew/dashboard/handlers/hooks.py": [("api_kiro_hooks", "dashboard")],
