@@ -18,6 +18,7 @@ Everything stays inside ``tmp_path``: no network, no subprocess, no fixed port
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 from pathlib import Path
@@ -442,6 +443,68 @@ class TestReviveIntendedInstances:
             "degraded",
             "ok",
         ]
+
+
+# ── _register_connections_warm_lifecycle ────────────────────────────────
+
+
+class TestConnectionsWarmLifecycle:
+    @pytest.mark.asyncio
+    async def test_startup_tracks_scavenging_without_blocking_and_cleanup_retires_runtime(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from kiro_crew.connections import warm
+
+        calls: list[str] = []
+        scavenge_started = asyncio.Event()
+        scavenge_release = asyncio.Event()
+
+        def _scavenge() -> int:
+            calls.append("scavenge")
+            return 0
+
+        async def _to_thread(func: Any, *args: Any) -> Any:
+            scavenge_started.set()
+            await scavenge_release.wait()
+            return func(*args)
+
+        async def _shutdown() -> None:
+            calls.append("shutdown")
+
+        # Patched on ``connections.warm``, which is where the hooks resolve both names: the
+        # imports are deliberately deferred into the hooks to keep the warm dependency graph
+        # off the gateway boot path, so this module's globals never hold them.
+        monkeypatch.setattr(warm, "scavenge_warm_mint_artifacts", _scavenge)
+        monkeypatch.setattr(warm, "shutdown_warm_mint", _shutdown)
+        monkeypatch.setattr(asyncio, "to_thread", _to_thread)
+        app = web.Application()
+        state = _state()
+        srv._register_connections_warm_lifecycle(app, state)
+        startup = next(
+            hook for hook in app.on_startup if hook.__name__ == "_connections_warm_startup"
+        )
+        cleanup = next(
+            hook for hook in app.on_cleanup if hook.__name__ == "_connections_warm_shutdown"
+        )
+
+        startup_task = asyncio.create_task(startup(app))
+        await scavenge_started.wait()
+
+        assert startup_task.done()
+        assert calls == []
+        assert len(state._background_tasks) == 1
+
+        scavenge_release.set()
+        await asyncio.gather(*state._background_tasks)
+        await cleanup(app)
+
+        assert calls == ["scavenge", "shutdown"]
+
+    def test_both_gateway_modes_register_the_same_lifecycle(self) -> None:
+        registration = "_register_connections_warm_lifecycle(app, state)"
+        assert registration in inspect.getsource(srv.start_dashboard)
+        assert registration in inspect.getsource(srv.start_api_server)
 
 
 # ── _register_prevent_sleep_shutdown ────────────────────────────────────

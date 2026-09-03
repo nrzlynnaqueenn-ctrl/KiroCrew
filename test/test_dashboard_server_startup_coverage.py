@@ -431,6 +431,7 @@ class TestStartDashboardWiring:
 
         later_hooks = (
             "_instances_shutdown",
+            "_connections_warm_shutdown",
             "_prevent_sleep_shutdown",
             "_status_sink_shutdown",
             "_contrib_shutdown",
@@ -443,7 +444,12 @@ class TestStartDashboardWiring:
         tunnel_at = cleanup.index("_tunnel_shutdown")
         for name in later_hooks:
             assert tunnel_at < cleanup.index(name), f"{name} would starve the tunnel teardown"
-        for name in ("_instances_startup", "_contrib_startup", "_hooks_startup"):
+        for name in (
+            "_instances_startup",
+            "_connections_warm_startup",
+            "_contrib_startup",
+            "_hooks_startup",
+        ):
             assert name in startup, f"missing on_startup hook: {name}"
 
     @pytest.mark.asyncio
