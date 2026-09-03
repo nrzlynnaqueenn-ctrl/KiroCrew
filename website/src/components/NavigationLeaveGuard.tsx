@@ -34,11 +34,17 @@ const NavigationLeaveGuardContext = React.createContext<Channel | null>(null)
  * That makes coverage OPT-IN per navigation surface, which is the known cost of
  * this shape: an in-app `navigate()` caller that does not ask still discards a
  * draft, and forgetting to ask fails silently. The exits wired today are this
- * layout's rail and mobile back bar, the global sidebar's `NavItem`, and the
- * command palette's `usePaletteActions` delegate. Browser Back/Forward cannot be
- * reached from here at all. Retiring the per-caller model -- a data router so
- * `useBlocker` becomes available, or lifting the draft so no exit destroys it --
- * is tracked in #8010; prefer adding to that over adding a fourth asker here.
+ * layout's rail and mobile back bar, the global sidebar's `NavItem`, the
+ * command palette's `usePaletteActions` delegate, and `SettingsLink` -- the one
+ * declarative Settings deep link, which asks once for every prose link built on
+ * it rather than per call site. Imperative `navigate(settingsPath(...))` callers
+ * (the update modal and pill, mobile connect, the approval-mode picker, the chat
+ * voice branch) do NOT ask; they are modal or menu actions the user just chose,
+ * and covering them one by one is the per-caller model this note argues against.
+ * Browser Back/Forward cannot be reached from here at all. Retiring the
+ * per-caller model -- a data router so `useBlocker` becomes available, or
+ * lifting the draft so no exit destroys it -- is tracked in #8010; prefer adding
+ * to that over wiring another individual caller here.
  */
 export function NavigationLeaveGuardProvider({ children }: { children: React.ReactNode }) {
   // One slot, not a registry: exactly one page is on screen at a time, so two

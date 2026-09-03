@@ -36,6 +36,7 @@ import { useIsNarrowViewport } from '../../hooks/useIsMobile'
 import { usePersistedString } from '../../hooks/usePersistedString'
 import { api, type AwsConsentStatus } from '../../api/client'
 import { i18nT } from '../../i18n/t'
+import { deployVars } from '../../components/destinationVars'
 import { fmtBytes, fmtNumber } from '../../i18n/format'
 import { awsControlApi, AwsControlError } from './api'
 import UsagePane, { ConnectionsSection, ReconnectAction, SetupCard } from './ConsoleView'
@@ -314,7 +315,7 @@ function AddAccounts() {
           {i18nT('apps.awsControl.page.add_accounts_title')}
         </h2>
         <p className="mt-1 text-[13px] text-muted" data-testid="add-accounts-unsupported">
-          {i18nT('apps.awsControl.page.add_accounts_unsupported')}
+          {i18nT('apps.awsControl.page.add_accounts_unsupported', deployVars())}
         </p>
       </section>
     )
@@ -513,7 +514,7 @@ function AccountsPane({ accountsQ, selected, onUse }: {
             testId="aws-control-empty"
             icon={<Cloud />}
             title={i18nT('apps.awsControl.page.empty_title')}
-            subtitle={i18nT('apps.awsControl.page.empty_body')}
+            subtitle={i18nT('apps.awsControl.page.empty_body', deployVars())}
           />
         </div>
       )}
