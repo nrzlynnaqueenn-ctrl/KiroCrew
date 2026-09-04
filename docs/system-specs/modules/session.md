@@ -391,18 +391,28 @@ conversation log, so the LLM has no memory of the interrupted request.
 Dashboard Edit + Send replaces the ACP session and rebuilds context from the
 retained canonical history. The discarded suffix is excluded from session
 replay, stop recovery, and persisted-history context; stable memory, rules,
-skills, and project context remain available.
+skills, and project context remain available. Both edit endpoints carry this
+contract: `rewind` (the dashboard chat's Edit + Send) and `edit-resend` (the
+same operation addressed by raw window index, used by embedded panels).
 
 The native conversation is discarded before the retained history rewrite, and
 the cleared resume pointer is flushed durably before the rewrite is committed,
 so a gateway restart cannot resurrect the discarded native session. If the
 rewrite fails -- or the slot was concurrently rebound to another transcript
-while it was in flight -- Edit + Send returns a 503 and restores the dashboard
-slot, but it cannot restore the discarded native session; a later turn
+while it was in flight -- Edit + Send returns a 503 and leaves the dashboard
+slot on the original branch (the live slot is never mutated before the
+commit), but it cannot restore the discarded native session; a later turn
 cold-starts from the original persisted history instead of resuming it.
-App-authenticated requests may rewind only a slot's own dashboard session:
+App-authenticated requests may edit only a slot's own dashboard session:
 a channel-linked slot is refused, because its effective session is a
 conversation the app does not own.
+
+`edit-resend` keeps three deliberate divergences from `rewind`: entries
+already queued when the edit arrives survive it (only a send diverted to the
+queue by the edit's own slot reservation is handed to the queue drain on
+abort), indexes resolve against the raw in-memory window rather than the
+chained archive-aware view, and the orphaned kiro-cli session file is left to
+kiro-cli's own GC instead of being deleted.
 
 ### Eager Respawn
 

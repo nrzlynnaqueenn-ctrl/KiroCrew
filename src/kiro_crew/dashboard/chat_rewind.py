@@ -1,13 +1,15 @@
 """Rewind — edit a past user message and re-run from that point in place.
 
-Unlike ``edit_resend`` (which truncates ``slot.messages`` in memory but
-leaves the backing kiro-cli session file with stale forward turns),
-``rewind`` swaps the underlying ACP session for a fresh one. This mirrors
+Like ``edit_resend``, ``rewind`` swaps the underlying ACP session for a
+fresh one (both share the same context-boundary contract: durable native
+clear before the history rewrite, retryable 503 on either boundary failing,
+live-slot mutation only after both commit). This mirrors
 kiro-cli's native ``/rewind`` slash command, which "rewinds the conversation
 to a previous turn, forks into a new session" — except the *user-visible*
-slot identity (key, title, folder, sidebar position) is preserved. The
-orphaned kiro-cli session file is deleted so it does not pollute
-``kiro-cli chat -l`` / the resume picker.
+slot identity (key, title, folder, sidebar position) is preserved. Unlike
+``edit_resend``, the orphaned kiro-cli session file is deleted so it does
+not pollute ``kiro-cli chat -l`` / the resume picker, and indexes are
+resolved against the chained (archive-aware) view.
 
 Contract:
 - ``POST /api/chat/slots/{slot}/rewind``
