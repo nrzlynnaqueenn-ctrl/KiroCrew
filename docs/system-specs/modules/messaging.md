@@ -60,7 +60,7 @@ Slack's transport path is gated behind the `messaging.use_transport` config flag
 | `messaging/sessions_view.py` | The channel-neutral recent-sessions collector (`_collect_recent_sessions` + its off-loop form). Takes an explicit `sessions_dir` so a surface owning its own data-home override threads it in rather than shadowing this module's; `slack/sessions_view.py` does exactly that and keeps the Block Kit rendering |
 | `messaging/privacy_mode.py` | The `!temporary` / `!incognito` session privacy modes, keyed by **session key** — two bounded LRUs, the durable `SessionMap` flag, one `is_restricted` predicate, the token strippers, and the SEL audit with the channel as a parameter. See [Session privacy modes](#session-privacy-modes-privacy_modepy) |
 | `messaging/auto_title.py` | Conversation auto-titling — the claim-early LRU, the tool-free bounded background turn, the prompt, and the title-cleaning rules. Renaming the platform conversation is a caller-supplied callback. See [Auto-titling](#auto-titling-auto_titlepy) |
-| `messaging/upload_gate.py` | `uploads_restricted(dashboard_state, session_key, channel_type=)` — the restricted-session ceiling on outbound file uploads, plus `live_dashboard_slot`. Three-state ladder (non-`dashboard:` key allows, a LIVE slot answers off `is_restricted`, otherwise the PERSISTED transcript mode answers and an unreadable one DENIES), audited per channel. Discord and Telegram both route here |
+| `messaging/upload_gate.py` | `session_is_restricted(dashboard_state, session_key, persisted_probe=, unknown_denies=True)` — the shared incognito/temporary decision, plus `uploads_restricted(...)` which adds the per-channel upload audit, plus `live_dashboard_slot`. Three-state ladder (non-`dashboard:` key answers off `privacy_mode`, a LIVE slot answers off `is_restricted`, otherwise the PERSISTED transcript mode answers). `unknown_denies` decides an unreadable mode: uploads DENY (bytes cannot be recalled), the durable-history gate ALLOWS (a closed tab and a legacy transcript read unknown too, and denying would lose ordinary history). Discord and Telegram both route here; Telegram's resumed turns also gate persistence on it |
 | `messaging/session_trust.py` | The per-session tool-Trust grant store: `is_session_trusted`, `add_trusted_session(key, sessions=)`, `clear_trusted_sessions`. In memory only, so an ad-hoc auto-approve grant dies with the process. The grant has TWO halves and both are load-bearing: the in-memory mapping the driver reads, and the session's approval policy set to `auto`, because a spawned subagent reads its parent's policy and never this mapping. So it is a `key -> SessionManager` MAPPING rather than a set, which is what lets `clear_trusted_sessions` undo the policy half too (back to `""`, the same value the dashboard's untrust toggle writes) without its caller having to hand a manager back. **Every mutation goes through the API**: reaching the container directly is how a revoke came to drop one half and leave subagents trusted, and a mapping has no `.add`, so a half-grant is not expressible either. Named `session_trust`, not `trust`, so it cannot be confused with a connection-admission roster: this grant is about what ONE session's tools may skip, not about which principals may attach. Consumed only through `TurnDriver`'s `auto_approve_session` predicate, which runs BEHIND the keystone, governance and deny-list gates, so a hard DENY still refuses |
 | `messaging/link.py` | **Layer 3** — session-key namespacing (`session_key`/`canonical_key`/`legacy_key`/`is_legacy_slack_key`) + `ChannelLink` + DM-scope key derivation / `should_rotate_generation`, plus the in-channel `/link` ⇄ `/unlink` pair (`rebind_conversation_location` / `release_conversation_location`) |
 | `messaging/conversation.py` | `ConversationState` — per-conversation rotating *generation* bookkeeping (advanced by `/new` and idle/daily reset), seeded from the persisted session map |
@@ -798,6 +798,23 @@ opening the dashboard:
   written under an earlier single-owner configuration cannot survive a roster
   change as an authorization bypass. Forum Topics cannot enumerate or resume
   dashboard history.
+- **A restricted dashboard session resumed here writes no transcript.** The turn's
+  durable write is skipped when `upload_gate.session_is_restricted` reports the
+  resumed session incognito or temporary — the same predicate the upload ceiling
+  reads, so one conversation cannot refuse the file and then record the text.
+  `privacy_mode.is_restricted` is **not** sufficient on this path: it answers off a
+  process-local tracker that only an inbound CHANNEL message populates, so for a
+  `dashboard:` key it reports unrestricted and fails open. It remains the gate
+  inside `_persist_turn` for Telegram's own native conversations. The decision is
+  made on the loop, before the worker thread the write runs in, because the live
+  slot registry and the persisted-transcript fallback are not reachable from it.
+  The two ceilings deliberately differ on an UNREADABLE persisted mode
+  (`unknown_denies`): an upload denies, because shipping bytes cannot be taken
+  back, while history allows, because a closed tab, a legacy transcript and a
+  gateway with no dashboard attached all read unknown and denying there would
+  silently stop recording ordinary conversations. Only an affirmative incognito
+  marker restricts a cold-resumed session. The live projection into that session's
+  own open window is not gated — it holds nothing to disk.
 
 ## Telegram forum topics (per-Topic sessions)
 

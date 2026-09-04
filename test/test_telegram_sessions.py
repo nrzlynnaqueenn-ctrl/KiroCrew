@@ -994,3 +994,120 @@ class TestTelegramResumeIntegration:
         shared = TelegramTransport(_Client(), allowed_user_ids={7, 8})
         assert shared.may_resume_from("7", None) is False
         assert shared.may_resume_from("8", None) is False
+
+
+class TestTelegramRestrictedResumedSession:
+    """An incognito or temporary DASHBOARD session resumed here writes no transcript.
+
+    The exposure this pins is specific to inbound resume: before Telegram could
+    resume, the persist path only ever saw a Telegram-native key, for which
+    ``privacy_mode.is_restricted`` is the right predicate. A resumed turn carries a
+    ``dashboard:`` key instead, and that predicate reads a process-local tracker a
+    dashboard slot never populates — so on its own it answers False for an
+    incognito session and the turn would land in durable history.
+    """
+
+    def _state(self, slot: Any) -> Any:
+        """Minimal dashboard state: only ``get_slot`` and ``sessions`` are read."""
+        return SimpleNamespace(sessions=None, get_slot=lambda name: slot)
+
+    @pytest.mark.asyncio
+    async def test_restricted_live_slot_is_reported_restricted(self, tmp_path: Any) -> None:
+        dispatcher, _, _, _ = _dispatcher(tmp_path)
+        dispatcher.dashboard_state = self._state(SimpleNamespace(is_restricted=True))
+
+        assert await dispatcher._session_restricted("dashboard:chat-1") is True
+
+    @pytest.mark.asyncio
+    async def test_unrestricted_live_slot_still_persists(self, tmp_path: Any) -> None:
+        dispatcher, _, _, _ = _dispatcher(tmp_path)
+        dispatcher.dashboard_state = self._state(SimpleNamespace(is_restricted=False))
+
+        assert await dispatcher._session_restricted("dashboard:chat-1") is False
+
+    @pytest.mark.asyncio
+    async def test_channel_privacy_mode_alone_would_have_failed_open(self, tmp_path: Any) -> None:
+        """The regression anchor: the native predicate cannot see this restriction."""
+        from kiro_crew.messaging import privacy_mode
+
+        dispatcher, _, _, _ = _dispatcher(tmp_path)
+        dispatcher.dashboard_state = self._state(SimpleNamespace(is_restricted=True))
+
+        # What the writer-side gate would have concluded on its own.
+        assert privacy_mode.is_restricted("dashboard:chat-1") is False
+        # What the caller-side ceiling concludes instead.
+        assert await dispatcher._session_restricted("dashboard:chat-1") is True
+
+    @pytest.mark.asyncio
+    async def test_a_closed_tab_keeps_recording_unless_the_mode_says_otherwise(
+        self, tmp_path: Any
+    ) -> None:
+        """No live slot: an unreadable mode must not silently stop recording.
+
+        The opposite of the upload ceiling, deliberately. A closed tab, a legacy
+        transcript and a gateway with no dashboard attached all read unknown, so
+        denying here would lose ordinary history rather than refuse one recoverable
+        action. Only an affirmative incognito marker restricts.
+        """
+        dispatcher, _, _, _ = _dispatcher(tmp_path)
+        dispatcher.dashboard_state = self._state(None)
+
+        assert await dispatcher._session_restricted("dashboard:never-existed") is False
+
+    @pytest.mark.asyncio
+    async def test_an_affirmative_incognito_marker_still_denies(self, tmp_path: Any) -> None:
+        """The closed-tab rung that DOES restrict: the transcript says incognito."""
+        from kiro_crew.messaging import upload_gate
+
+        assert (
+            upload_gate._persisted_mode_is_restricted(
+                "dashboard:gone", lambda name: (True, "incognito"), False
+            )
+            is True
+        )
+        assert (
+            upload_gate._persisted_mode_is_restricted(
+                "dashboard:gone", lambda name: (True, "persistent"), False
+            )
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_upload_ceiling_keeps_denying_an_unknown_mode(self, tmp_path: Any) -> None:
+        """The two postures are independent: uploads still fail closed."""
+        from kiro_crew.messaging import upload_gate
+
+        assert (
+            upload_gate._persisted_mode_is_restricted("dashboard:gone", lambda name: (False, None))
+            is True
+        )
+        assert (
+            upload_gate._persisted_mode_is_restricted(
+                "dashboard:gone", lambda name: (False, None), False
+            )
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_native_telegram_key_is_unaffected(self, tmp_path: Any) -> None:
+        """A key with no dashboard slot falls back to this channel's own mode."""
+        dispatcher, _, _, _ = _dispatcher(tmp_path)
+        dispatcher.dashboard_state = self._state(SimpleNamespace(is_restricted=True))
+
+        assert await dispatcher._session_restricted("telegram:direct:7") is False
+
+    def test_the_persist_call_is_guarded_by_that_decision(self) -> None:
+        """The ceiling is only a ceiling if the turn path consults it.
+
+        Source-level because the alternative is driving a whole turn to observe an
+        absent write; what matters is the ORDER — the decision is made on the loop,
+        before the worker-thread write it guards.
+        """
+        import inspect
+
+        src = inspect.getsource(TelegramDispatcher)
+        decided = src.index("dashboard_restricted = await self._session_restricted(")
+        guarded = src.index("if not dashboard_restricted:")
+        persisted = src.index("self._persist_turn,")
+
+        assert decided < guarded < persisted

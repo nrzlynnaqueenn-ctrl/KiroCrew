@@ -84,7 +84,7 @@ from kiro_crew.messaging.session_resume import (
 )
 from kiro_crew.messaging.session_trust import add_trusted_session, is_session_trusted
 from kiro_crew.messaging.transport import InboundMessage
-from kiro_crew.messaging.upload_gate import uploads_restricted
+from kiro_crew.messaging.upload_gate import session_is_restricted, uploads_restricted
 from kiro_crew.safety_override import safety_override
 from kiro_crew.security import redact, redact_local_paths
 from kiro_crew.sel import sel
@@ -998,6 +998,13 @@ class TelegramDispatcher:
             try:
                 from kiro_crew.dashboard.channel_slots import project_channel_turn_live
 
+                # Decided HERE, on the loop, because a resumed dashboard session's
+                # restriction lives on its live slot (or, with the tab closed, in
+                # the persisted transcript) — neither reachable from the worker
+                # thread the write runs in. Only the durable write is gated: the
+                # projection below appends to that session's OWN open window, which
+                # is where the user already is, and holds nothing to disk.
+                dashboard_restricted = await self._session_restricted(session_key)
                 mirror_mids = project_channel_turn_live(
                     self.dashboard_state,
                     session_key,
@@ -1005,15 +1012,16 @@ class TelegramDispatcher:
                     accumulated,
                     broadcast_user=True,
                 )
-                await asyncio.to_thread(
-                    self._persist_turn,
-                    session_key,
-                    text,
-                    accumulated,
-                    is_new_own_session,
-                    agent=agent,
-                    mirror_mids=mirror_mids,
-                )
+                if not dashboard_restricted:
+                    await asyncio.to_thread(
+                        self._persist_turn,
+                        session_key,
+                        text,
+                        accumulated,
+                        is_new_own_session,
+                        agent=agent,
+                        mirror_mids=mirror_mids,
+                    )
             except Exception:
                 logger.warning(
                     "Telegram: persist_turn failed session=%s", session_key, exc_info=True
@@ -2009,6 +2017,39 @@ class TelegramDispatcher:
             return None
         return getattr(msg, "message_id", 0) or None
 
+    async def _session_restricted(self, session_key: str) -> bool:
+        """True when this session is incognito or temporary, so nothing may persist.
+
+        The same predicate the upload ceiling reads
+        (:func:`kiro_crew.messaging.upload_gate.session_is_restricted`), asked here
+        before the durable history write. A resumed Telegram turn can carry a
+        ``dashboard:`` key whose restriction lives on its live slot rather than in
+        this process's channel trackers, which is exactly the case
+        ``privacy_mode.is_restricted`` cannot see.
+
+        The LIVE slot is the authoritative rung and the one the exposure needs: a
+        restricted tab that is open is exactly the case that would otherwise write.
+        With the tab closed this falls back to the persisted ``memory_mode`` and
+        restricts only on an AFFIRMATIVE incognito marker — ``unknown_denies`` is
+        off here, unlike the upload ceiling, because an unreadable mode is also
+        what a legacy transcript and a gateway with no dashboard attached both
+        report, and denying there would silently stop recording ordinary
+        conversations rather than refuse one recoverable action.
+
+        The persisted-transcript probe is passed IN for the same reason as in
+        :meth:`_uploads_restricted`: ``messaging`` may not import ``dashboard``, so
+        the import lives here and stays function-local because the dashboard
+        gateway imports the channel transports.
+        """
+        from kiro_crew.dashboard.handlers._shared import _probe_persisted_session
+
+        return await session_is_restricted(
+            self.dashboard_state,
+            session_key,
+            persisted_probe=_probe_persisted_session,
+            unknown_denies=False,
+        )
+
     async def _uploads_restricted(self, session_key: str) -> bool:
         """True when this session must not ship local file bytes to Telegram.
 
@@ -2924,7 +2965,21 @@ class TelegramDispatcher:
         agent: str | None = None,
         mirror_mids: tuple[str, str] | None = None,
     ) -> None:
-        """Persist one atomic turn, deduplicating rows already projected live."""
+        """Persist one atomic turn, deduplicating rows already projected live.
+
+        ``privacy_mode.is_restricted`` is this channel's OWN privacy gate and is
+        checked here, at the only writer, so it covers the turn, the drained queue
+        and the steered continuation alike.
+
+        It is NOT the whole ceiling for a RESUMED dashboard session. That
+        predicate reads a process-local tracker which only an inbound CHANNEL
+        message populates, so it answers ``False`` for an incognito dashboard slot
+        and fails open. That rung is decided by the CALLER, through
+        :meth:`_session_restricted`, which skips this call entirely — it needs the
+        live slot registry and, failing that, an await on the persisted transcript,
+        neither reachable from the worker thread this runs in. A second caller must
+        make the same check before calling.
+        """
         if self.conv_log is None or privacy_mode.is_restricted(session_key):
             return
         with self.conv_log.atomic_appends(session_key):
