@@ -604,6 +604,14 @@ class JobHandle:
     def run_id(self) -> str:
         return self._run.run_id
 
+    @property
+    def kind(self) -> str:
+        return self._run.kind
+
+    @property
+    def status(self) -> str:
+        return self._run.status
+
 
 #: A runner receives its handle and nothing else. P1 has no parameter channel:
 #: caller-supplied ``params`` was the other half of what made a record hold
@@ -1396,6 +1404,14 @@ class JobSDK:
         killed, and abandoning it is the defect rather than the fix.
 
         A worker that outlives the deadline is reported, not waited on forever.
+        Every run this call kills leaves one SEL line (``job_killed_on_disable``)
+        carrying its id and kind before the record is deleted, so "which runs
+        did the disable kill" stays answerable after the records are gone. The
+        trace is fail-closed: if it cannot be written durably, the deletion is
+        refused and reported as a failed cleanup; the surviving records are
+        retried by the next cleanup on a fresh instance (disable also forgets
+        the SDK, so that means after a re-enable, or by ``reconcile`` at the
+        next start).
         Gateway shutdown is a separate case left as accepted residue: these are
         daemon threads, so the interpreter reaps them at exit without a chance
         to finish, and draining every app's runs there would delay shutdown for
@@ -1431,12 +1447,97 @@ class JobSDK:
         if stubborn:
             logger.warning(
                 "App %s: %d job worker(s) did not stop within %.0fs and are still "
-                "running with their records removed: %s",
+                "running with their records removed; run id(s): %s",
                 self._app_name,
                 len(stubborn),
                 _CLEANUP_JOIN_SECS,
                 ", ".join(stubborn),
             )
+
+        # One durable SEL line per run this disable kills, BEFORE the records
+        # are deleted -- deletion is the last moment the identities exist, and
+        # the count-only summary below cannot answer "which runs were killed".
+        # Mirrors the per-run precedent ``reconcile`` set with
+        # ``job_interrupted``. The marker comes from the SAME observation that
+        # feeds the summary's stubborn count -- ``_join_workers`` captures the
+        # run ids alive at their join deadline -- so the summary can never say
+        # "one was stubborn" while no line names it. The records are read once,
+        # off the loop, and a live entry whose record is already terminal is
+        # skipped: its worker finished on its own before the discard landed, so
+        # nothing was killed.
+        stubborn_ids = set(stubborn)
+        live_ids = {entry.handle.run_id for entry in live}
+
+        def _scan() -> tuple[dict[str, JobRun | None], list[JobRun]]:
+            # Live statuses are read by CANONICAL FILENAME, one per live id --
+            # never from an id-keyed index over ``iter_runs``: a record file
+            # whose BODY claims a live run's id (with terminal status) would
+            # shadow the real record in such an index and suppress that run's
+            # kill line. ``read`` validates the id and opens ``<id>.json``, so
+            # a lying body in some other file cannot speak for a live run.
+            live_records = {run_id: self._store.read(run_id) for run_id in live_ids}
+            stale_runs = [
+                run
+                for run in self._store.iter_runs()
+                if not run.is_terminal and run.run_id not in live_ids
+            ]
+            return live_records, stale_runs
+
+        live_records, stale_runs = await asyncio.to_thread(_scan)
+        killed: list[str] = []
+        for entry in live:
+            record = live_records.get(entry.handle.run_id)
+            if record is not None and record.is_terminal:
+                continue
+            # The disk record is not the only truth for a JOINED worker: one
+            # that computed DONE/FAILED before the cancel landed, but whose
+            # terminal write the discard guard then refused, has already
+            # audited its own completion (``job_done``/``job_failed``) while
+            # its record stays non-terminal on disk. Reading the in-memory
+            # status closes that window -- the SEL trail must not carry both a
+            # completion and a kill for one run. Two deliberate exceptions:
+            # CANCELLED means the disable's own signal stopped the worker,
+            # which is exactly a killed run; and a run observed STUBBORN at its
+            # join deadline keeps its line no matter what its status became
+            # afterwards (a post-deadline raise flips it to FAILED), because
+            # the summary already counted it from that same observation and
+            # the count must never name a stubborn run no line identifies.
+            if entry.handle.run_id not in stubborn_ids and entry.handle.status in (DONE, FAILED):
+                continue
+            marker = " still_running" if entry.handle.run_id in stubborn_ids else ""
+            killed.append(f"{entry.handle.run_id} kind={entry.handle.kind}{marker}")
+        # A non-terminal record with no live worker (a foreign process's run
+        # that never got reconciled) vanishes in the same delete, so it gets
+        # the same line, marked ``stale`` because nothing was killed: there was
+        # no worker to kill. Its fields come off DISK -- the one input here not
+        # minted by this process -- so ``run_id`` is length-clipped and ``kind``
+        # is redacted, bounded, and repr-quoted rather than interpolated raw
+        # into a durable SEL field.
+        for run in stale_runs:
+            killed.append(f"{run.run_id[:_RUN_ID_LEN]} kind={_redact(run.kind)[:32]!r} stale")
+        if killed:
+            # The kill trace is the ONLY durable answer to "which runs did this
+            # disable kill", so it is fail-closed: each line is written
+            # synchronously (``critical=True``) and a write failure REFUSES the
+            # record deletion below. The records stay on disk -- still
+            # non-terminal, since their handles are discarded -- so a later
+            # cleanup on a fresh instance (after a re-enable, or ``reconcile``
+            # at the next start) resolves them instead of deleting identities
+            # nothing recorded. Reported through the existing partial-cleanup
+            # contract instead of raising into the disable route.
+            def _emit() -> None:
+                for line in killed:
+                    self._audit("job_killed_on_disable", line, "ok", critical=True)
+
+            try:
+                await asyncio.to_thread(_emit)
+            except Exception:  # noqa: BLE001 - refusing the delete IS the handling
+                logger.exception(
+                    "App %s: could not durably audit killed job run(s); record "
+                    "deletion refused so their identities are not lost",
+                    self._app_name,
+                )
+                return CleanupResult(removed=0, failed=len(killed), still_running=len(stubborn))
 
         removed, failed = await asyncio.to_thread(self._store.remove_all)
         if removed or failed:
@@ -1452,7 +1553,11 @@ class JobSDK:
 
     def _join_workers(self, live: list[_Live]) -> list[str]:
         """Wait for each STARTED worker, bounded. Runs on a worker thread, never
-        the loop.
+        the loop. Returns the RUN IDS of workers still alive at their deadline:
+        run ids are unique where thread names are minted per kind, and this one
+        observation feeds the count, the log line, and the per-run SEL marker --
+        two observations taken at different times could disagree, reporting a
+        stubborn count with no line saying which run it was.
 
         An entry whose thread never started is skipped rather than joined, and it
         cannot be stubborn: no code of the app is executing, so there is nothing
@@ -1468,12 +1573,20 @@ class JobSDK:
                 continue
             entry.thread.join(timeout=_CLEANUP_JOIN_SECS)
             if entry.thread.is_alive():
-                stubborn.append(entry.thread.name)
+                stubborn.append(entry.handle.run_id)
         return stubborn
 
     # ── Audit ──
 
-    def _audit(self, operation: str, resources: str, outcome: str, *, error: str = "") -> None:
+    def _audit(
+        self,
+        operation: str,
+        resources: str,
+        outcome: str,
+        *,
+        error: str = "",
+        critical: bool = False,
+    ) -> None:
         try:
             sel().log_api_access(
                 caller=f"app:{self._app_name}",
@@ -1482,8 +1595,13 @@ class JobSDK:
                 source=self._app_name,
                 resources=resources[:200],
                 error=error[:200],
+                critical=critical,
             )
         except Exception:  # noqa: BLE001 - an audit failure must not fail the job
+            # ... unless the caller said it must: ``critical`` re-raises so a
+            # fail-closed audit can refuse the action it was auditing.
+            if critical:
+                raise
             logger.debug("job SEL audit failed", exc_info=True)
 
 
