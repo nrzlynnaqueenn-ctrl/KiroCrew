@@ -975,6 +975,50 @@ jobs:
               echo "</details>"
             else
               echo "_No completed GPT verdict for this commit; see the Fork GPT 5.6 Review job logs._"
+              # REPORTING ONLY. Without this, a review that ran to completion but
+              # whose `[GPT-REVIEWED] <sha>` stamp is absent or SHA-corrupted put
+              # its entire body in the job logs and posted only the line above --
+              # the reader saw "no verdict" and could not tell a clean review with
+              # a mangled stamp from a review that never produced findings. Show
+              # the captured body; it is already credential-redacted by "Redact
+              # credential shapes" above, which runs `if: always()`.
+              #
+              # Every marker is DE-BRACKETED first. pr_status.py's
+              # REVIEWED_STAMP_RE (`\[([A-Z][A-Z0-9_-]*)-REVIEWED\]\s+<sha>`) and
+              # BLOCK_MERGE_RE (`\[BLOCK-MERGE\]\s+<sha>`) both anchor on a
+              # literal "[", so a de-bracketed token is inert to them in exactly
+              # the way an absent one is. That is the point: today this branch
+              # posts no body and pr_status.py sees no markers, and after this
+              # change it still sees none, so nothing downstream reads an
+              # unstamped review as freshly reviewed or as a posted verdict.
+              #
+              # The pattern deliberately matches the BRACKETED TOKEN ALONE and
+              # does NOT require a following sha. Requiring one would reintroduce
+              # the exact hole this branch exists to avoid: Python's `\s+` spans
+              # newlines but line-oriented sed cannot, so a model emitting
+              # `[GPT-REVIEWED]\n<sha>` would slip past a sha-anchored sed while
+              # pr_status.py still read it as a live stamp -- and that spelling
+              # lands HERE precisely because the `grep -Fq` above is single-line
+              # too, so it fails to find the marker and sends us down this branch.
+              # Both parser patterns need `[NAME-REVIEWED]` / `[BLOCK-MERGE]`
+              # contiguous on one line (their character classes exclude newline),
+              # so breaking the bracket alone cannot be bypassed by any
+              # whitespace arrangement.
+              # This branch does not decide the check-run; "Finalize check-run
+              # (fail closed)" below re-derives it from the same missing stamp and
+              # stays `failure`.
+              if [ -s codex-review-output.md ]; then
+                echo
+                echo "<details>"
+                echo "<summary>Captured review output — no verdict stamp for this commit, so this is NOT a verdict</summary>"
+                echo
+                sed -E \
+                  -e 's/\[([A-Z][A-Z0-9_-]*)-REVIEWED\]/(\1-REVIEWED-UNSTAMPED)/g' \
+                  -e 's/\[BLOCK-MERGE\]/(BLOCK-MERGE-UNSTAMPED)/g' \
+                  codex-review-output.md
+                echo
+                echo "</details>"
+              fi
             fi
             if [ -s codex-adjudication.md ]; then
               echo
