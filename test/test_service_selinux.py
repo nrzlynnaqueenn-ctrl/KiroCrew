@@ -10,6 +10,7 @@ workstation, and a test must never be in a position to write to selinuxfs.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -510,8 +511,14 @@ class TestInstallRefusesAnUnstartableSystemUnit:
         msg = str(exc.value)
         assert "$USER" not in msg, "the pasting shell must not choose the account"
         assert "~/" not in msg, "the pasting shell must not choose the home"
-        # The resolved account and its absolute home instead.
-        assert "/home/tester/.config/systemd/user/kirocrew.service" in msg
+        # Joined the same way the code joins it rather than hard-coded with
+        # forward slashes: this file is collected on Windows, where Path renders
+        # separators as backslashes, and a POSIX-spelled literal here fails there
+        # for a reason that has nothing to do with the property being tested.
+        expected_unit = (
+            Path("/home/tester") / svc_linux.USER_UNIT_SUBDIR / (f"{SERVICE_NAME}.service")
+        )
+        assert str(expected_unit) in msg
         assert "loginctl enable-linger tester" in msg
 
     def test_refusal_warns_that_a_root_shell_would_run_the_agent_as_root(self, monkeypatch):
