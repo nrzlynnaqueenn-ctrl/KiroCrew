@@ -136,6 +136,53 @@ def _probe_proc(communicate: Any, *, returncode: int = 0) -> MagicMock:
 class TestWarnIfKiroCliOutdated:
     """The boot-time kiro-cli version probe never raises and never hangs."""
 
+    @pytest.fixture(autouse=True)
+    def _resolvable_kiro_cli(self):
+        """Every arm below exercises the spawn, which now needs a resolved path.
+
+        The probe resolves kiro-cli from the fixed install directories before
+        spawning, so without this the arms would take the "not installed" early
+        return on a host that has no kiro-cli and assert against a spawn that
+        never happened. The refusal path itself is covered separately by
+        :meth:`test_unresolvable_binary_never_spawns`.
+        """
+        with patch(
+            "kiro_crew.slack.gateway.resolve_kiro_cli", return_value="/opt/pinned/bin/kiro-cli"
+        ):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_binary_never_spawns(self, capsys):
+        """An unresolvable kiro-cli is not spawned by bare name.
+
+        This probe runs unattended at gateway boot, so falling back to a bare
+        argv0 would let a `PATH`-planted shim execute here — the `--version`
+        argument is no protection. Nothing to warn about, so nothing runs.
+        """
+        orch = _make_orchestrator()
+        with patch("kiro_crew.slack.gateway.resolve_kiro_cli", return_value=None):
+            with patch("asyncio.create_subprocess_exec") as spawn:
+                await orch._warn_if_kiro_cli_outdated()
+        spawn.assert_not_called()
+        assert "outdated" not in capsys.readouterr().out
+
+    @pytest.mark.asyncio
+    async def test_probe_execs_resolved_absolute_path(self):
+        """The resolved absolute path is argv0, and `PATH` is out of the lookup."""
+
+        async def _communicate() -> tuple[bytes, bytes]:
+            return (b"kiro-cli 9.9.9", b"")
+
+        proc = _probe_proc(_communicate)
+        orch = _make_orchestrator()
+        with patch(
+            "kiro_crew.slack.gateway.resolve_kiro_cli", return_value="/opt/pinned/bin/kiro-cli"
+        ) as mock_resolve:
+            with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as spawn:
+                await orch._warn_if_kiro_cli_outdated()
+        assert spawn.await_args.args[0] == "/opt/pinned/bin/kiro-cli"
+        mock_resolve.assert_called_once_with(include_inherited_path=False)
+
     @pytest.mark.asyncio
     async def test_unspawnable_binary_is_silent(self, capsys):
         orch = _make_orchestrator()

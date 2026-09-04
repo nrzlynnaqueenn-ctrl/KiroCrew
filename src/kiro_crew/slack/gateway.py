@@ -172,6 +172,7 @@ from kiro_crew.heartbeat import (
 )
 from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.hooks import HookManager, HooksConfig, hooks_config_from_config_dict
+from kiro_crew.kiro_cli import resolve_kiro_cli
 from kiro_crew.learn import LessonStore
 from kiro_crew.llm_helpers import (
     PromptBusyExhaustedError,
@@ -2408,10 +2409,19 @@ class GatewayOrchestrator:
         stall every other callback for the 5s budget, and a timeout is logged
         (not silently swallowed) so a wedged kiro-cli that costs 5s on every
         boot is diagnosable from gateway.log.
+
+        Resolved the same way the auto-update resolves it: the absolute path
+        from the fixed known install directories, never a bare argv0 the
+        inherited `PATH` gets to answer. This probe runs unattended at boot, so
+        a planted shim would execute here regardless of the `--version`
+        argument. An unresolvable kiro-cli has no version to warn about.
         """
+        kiro_cli_bin = await asyncio.to_thread(resolve_kiro_cli, include_inherited_path=False)
+        if kiro_cli_bin is None:
+            return
         try:
             proc = await asyncio.create_subprocess_exec(
-                "kiro-cli",
+                kiro_cli_bin,
                 "--version",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -10035,12 +10045,28 @@ class GatewayOrchestrator:
                 return
             logger.info("Auto-update: reset to origin/%s, rebuilding", branch)
 
-            # Update the optional kiro-cli backend if present.
-            if shutil.which("kiro-cli"):
+            # Update the optional kiro-cli backend if present. The resolved
+            # absolute path is what runs, from the fixed known install
+            # directories only: `include_inherited_path=False` keeps a `PATH`
+            # that leads with an agent-writable directory (a worktree venv's
+            # `bin`) from naming the binary this unattended path executes.
+            #
+            # `resolve_kiro_cli` rather than `trusted_system_bin`: kiro-cli is a
+            # user-installed backend living in `~/.local/bin` (see
+            # `known_kiro_cli_dirs`), never in the system directories, so the
+            # system-tool pin resolves `None` on every real install. `None`
+            # means do not spawn it — skipped like any absent backend, which
+            # this step already treats as non-fatal.
+            #
+            # Off the loop: the resolver stats candidate directories under
+            # `Path.home()`, and a network-mounted home stalls the gateway for
+            # the length of that walk.
+            kiro_cli_bin = await asyncio.to_thread(resolve_kiro_cli, include_inherited_path=False)
+            if kiro_cli_bin is not None:
                 kiro_update: asyncio.subprocess.Process | None = None
                 try:
                     kiro_update = await asyncio.create_subprocess_exec(
-                        "kiro-cli",
+                        kiro_cli_bin,
                         "update",
                         stdout=asyncio.subprocess.DEVNULL,
                         stderr=asyncio.subprocess.DEVNULL,
