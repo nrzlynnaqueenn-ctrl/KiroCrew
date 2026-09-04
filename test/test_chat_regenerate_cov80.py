@@ -14,11 +14,12 @@ reachable; ``_run_chat`` is always patched, so no backend session is started.
 from __future__ import annotations
 
 import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 from chat_test_helpers import _make_state
 
 from kiro_crew.dashboard.chat_regenerate import (
@@ -689,6 +690,68 @@ async def test_edit_resend_discards_the_native_conversation_before_persisting(st
     # The edited turn is dispatched after the commit.
     run.assert_awaited_once()
     assert run.await_args.args[2] == "edited"
+
+
+@pytest.mark.asyncio
+async def test_edit_resend_cancelled_mid_save_keeps_live_and_disk_in_sync(state) -> None:
+    """A client disconnect during the save must not desync disk from the live
+    slot. The worker thread finishes the destructive rewrite regardless of the
+    handler's fate; on cancellation the handler waits for the worker's outcome,
+    commits the live slot to match the persisted window, and still dispatches
+    the edited prompt. Mirrors
+    test_dashboard_chat_rewind::test_rewind_cancelled_mid_save_still_commits_the_landed_rewrite.
+    """
+    slot = state.get_or_create_slot("s1")
+    slot.append("user", "first")
+    slot.append("assistant", "answer")
+    slot.drain()
+
+    save_started = threading.Event()
+    release = threading.Event()
+    saved_windows: list[list[str]] = []
+
+    def _gated_save(_state, _slot, msgs_snapshot, **_kwargs):
+        # Record the window the worker thread persisted to "disk", then block
+        # so the test can cancel the handler while the save is in flight.
+        saved_windows.append([m["content"] for m in msgs_snapshot])
+        save_started.set()
+        release.wait()
+        return True
+
+    run = AsyncMock()
+    with (
+        patch("kiro_crew.dashboard.chat_regenerate._save_slot_to_history", side_effect=_gated_save),
+        patch("kiro_crew.dashboard.chat_regenerate._run_chat", new=run),
+    ):
+        app = _make_regen_app(state)
+        fake_request = make_mocked_request(
+            "POST", "/api/chat/slots/s1/edit-resend", match_info={"slot": "s1"}, app=app
+        )
+        fake_request["app"] = ""
+
+        async def _json():
+            return {"index": 0, "content": "edited"}
+
+        fake_request.json = _json  # type: ignore[method-assign]
+        handler_task = asyncio.create_task(api_chat_slot_edit_resend(fake_request))
+        await asyncio.wait_for(asyncio.to_thread(save_started.wait), timeout=2)
+        handler_task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await handler_task
+
+        # The rewrite landed on "disk" with the truncated+edited window; the
+        # live slot must have adopted the SAME window rather than keeping the
+        # full original one (which the next flush would push back over disk).
+        assert saved_windows == [["edited"]]
+        assert [m["content"] for m in slot.messages] == ["edited"]
+        # The edited prompt is still dispatched.
+        for _ in range(50):
+            if run.await_count:
+                break
+            await asyncio.sleep(0.02)
+        run.assert_awaited_once()
+        assert run.await_args.args[2] == "edited"
 
 
 @pytest.mark.asyncio

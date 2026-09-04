@@ -287,10 +287,6 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
         prospective_slot.messages = list(slot.messages[:index])
         prospective_slot._dirty = True
         prospective_slot._resumed_count = 0
-        # The window was truncated → the next save MUST take the archive-safe
-        # rewrite path. Set it on the COPY only; the live slot keeps its current
-        # flag until the commit below adopts the prepared state.
-        prospective_slot._pending_rewrite = True
         prospective_slot.append("user", _bc, "msg msg-u")
         msgs_snapshot = list(prospective_slot.messages)
 
@@ -350,21 +346,91 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
                     status=503,
                 )
 
+        def _on_done(t: asyncio.Task) -> None:
+            if not t.cancelled() and t.exception() is not None:
+                logger.error(
+                    "edit-resend _run_chat failed for %s", slot.key, exc_info=t.exception()
+                )
+
+        def _commit_and_dispatch() -> None:
+            """Adopt the prepared state on the live slot and dispatch the turn.
+
+            Shared by the normal success path and the cancellation path below:
+            once the destructive rewrite has landed on disk, this is the only
+            thing that keeps the live slot matching it (and gets the edited
+            prompt dispatched). No await inside, so it is atomic on the event
+            loop.
+            """
+            slot.messages = prospective_slot.messages
+            slot.invalidate_source_links()
+            slot._dirty = True
+            slot._resumed_count = 0
+
+            sel().log_api_access(
+                caller="dashboard",
+                operation="chat.edit_resend",
+                outcome="allowed",
+                source="dashboard",
+                resources=slot.key,
+            )
+
+            task = asyncio.create_task(
+                _run_chat(
+                    state,
+                    slot,
+                    _bc,
+                    _directive_user_origin=not bool(request.get("app", "")),
+                )
+            )
+            slot.task = task
+            state._background_tasks.add(task)
+            task.add_done_callback(state._background_tasks.discard)
+            task.add_done_callback(_on_done)
+
         # Persist the truncated+edited history via the explicit-snapshot
         # rewrite path. Nothing was mutated on the live slot yet, so a failure
         # (exception OR a save refused by its own guards) means nothing
-        # persisted: no live mutation and no dispatch. Unlike rewind, edit-resend
-        # has no queue-reservation machinery holding a competing send off the
-        # slot, so there is no committed-rewrite-without-dispatch window to
-        # shield against here -- a bare await is correct and kept simple.
-        try:
-            saved = await asyncio.to_thread(
+        # persisted: no live mutation and no dispatch.
+        #
+        # The worker thread cannot be interrupted: once the rewrite starts it
+        # WILL finish, whether or not this handler is still alive. A client
+        # disconnect cancels the handler task, and a bare await here would then
+        # abandon a completed destructive rewrite -- persisted history
+        # truncated, the live slot still holding the full original window, and
+        # the next periodic dirty-slot flush re-serializing that stale window
+        # back over the truncated file. That is exactly the "live window
+        # desynchronized from disk" failure this change set out to close, so
+        # shield the save; on cancellation, wait for the worker's real outcome
+        # and, if the rewrite landed on the transcript we authorized, commit the
+        # live slot to match disk and dispatch the edited prompt before
+        # propagating the cancellation. (This is independent of rewind's OTHER
+        # use of the shield -- protecting a reserved queue-dispatch task, which
+        # edit-resend genuinely lacks.)
+        save_task = asyncio.ensure_future(
+            asyncio.to_thread(
                 _save_slot_to_history,
                 state,
                 slot,
                 msgs_snapshot,
                 expected_history_key=expected_history_key,
             )
+        )
+        try:
+            saved = await asyncio.shield(save_task)
+        except asyncio.CancelledError:
+            landed = False
+            try:
+                landed = bool(await save_task)
+            except Exception:
+                landed = False
+            if landed and slot_history_key(slot) == expected_history_key:
+                _commit_and_dispatch()
+                logger.info(
+                    "edit-resend: request cancelled after the rewrite landed for %s; "
+                    "committed live state and dispatched the edited prompt",
+                    slot.key,
+                )
+            raise
         except Exception:
             logger.warning("edit-resend: failed to persist", exc_info=True)
             state.push_slots_update()
@@ -397,38 +463,7 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
         # Both boundaries committed. Adopt the prepared state on the LIVE slot
         # and dispatch the replacement turn. No await between the save above and
         # these mutations, so they are atomic on the event loop.
-        slot.messages = prospective_slot.messages
-        slot.invalidate_source_links()
-        slot._dirty = True
-        slot._resumed_count = 0
-
-        sel().log_api_access(
-            caller="dashboard",
-            operation="chat.edit_resend",
-            outcome="allowed",
-            source="dashboard",
-            resources=slot.key,
-        )
-
-        task = asyncio.create_task(
-            _run_chat(
-                state,
-                slot,
-                _bc,
-                _directive_user_origin=not bool(request.get("app", "")),
-            )
-        )
-        slot.task = task
-        state._background_tasks.add(task)
-        task.add_done_callback(state._background_tasks.discard)
-
-        def _on_done(t: asyncio.Task) -> None:
-            if not t.cancelled() and t.exception() is not None:
-                logger.error(
-                    "edit-resend _run_chat failed for %s", slot.key, exc_info=t.exception()
-                )
-
-        task.add_done_callback(_on_done)
+        _commit_and_dispatch()
 
     state.push_slots_update()
     return web.json_response({"ok": True})
