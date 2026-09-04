@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 
 from aiohttp import web
 
 from kiro_crew.dashboard.chat_persistence import _save_slot_to_history
 from kiro_crew.dashboard.chat_runner import _run_chat
+from kiro_crew.dashboard.chat_utils import effective_session_key, slot_history_key
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -266,19 +268,139 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
                 {"error": "index or ts required", "code": "index_or_ts_required"}, status=400
             )
 
-        del slot.messages[index:]
-        slot._dirty = True
-        slot._resumed_count = 0
+        # Capture routing/orphan state BEFORE any live mutation, exactly like
+        # rewind: the truncation is a real conversation boundary, so the native
+        # ACP conversation must be discarded and the truncated history durably
+        # saved before the live slot adopts the edit or any replacement turn is
+        # dispatched. session_key addresses the session whose native resume
+        # identity is cleared; expected_history_key is the transcript this edit
+        # was authorized against.
+        session_key = effective_session_key(slot)
+        expected_history_key = slot_history_key(slot)
 
+        # Prepare the truncated+edited window on a COPY. The dirty-slot flush
+        # can run while either durable boundary below is pending, so exposing a
+        # truncated live window here could make a rejected edit permanent.
         _bc, _ = redact_exfiltration_urls(content)
         _bc, _ = redact_credentials(_bc)
-        slot.append("user", _bc, "msg msg-u")
+        prospective_slot = copy.copy(slot)
+        prospective_slot.messages = list(slot.messages[:index])
+        prospective_slot._dirty = True
+        prospective_slot._resumed_count = 0
+        # The window was truncated → the next save MUST take the archive-safe
+        # rewrite path. Set it on the COPY only; the live slot keeps its current
+        # flag until the commit below adopts the prepared state.
+        prospective_slot._pending_rewrite = True
+        prospective_slot.append("user", _bc, "msg msg-u")
+        msgs_snapshot = list(prospective_slot.messages)
 
+        # Durably clear the native conversation BEFORE the history rewrite,
+        # mirroring rewind. A failure here leaves the original branch intact and
+        # dispatches no replacement turn.
+        if state.sessions is not None:
+            try:
+                # ``skip_if_busy``: an inbound channel turn holds the session
+                # semaphore while ``slot.running`` reads False, so the idle
+                # check above cannot see it -- an unconditional discard would
+                # tear down its provider mid-reply.
+                discarded = await state.sessions.discard_conversation(
+                    session_key, skip_if_busy=True
+                )
+            except Exception:
+                logger.warning(
+                    "edit-resend: failed to discard ACP conversation for %s",
+                    session_key,
+                    exc_info=True,
+                )
+                state.push_slots_update()
+                return web.json_response(
+                    {
+                        "error": "could not prepare edited conversation; retry the edit",
+                        "code": "edit_resend_prepare_failed",
+                    },
+                    status=503,
+                )
+            if not discarded:
+                state.push_slots_update()
+                return web.json_response(
+                    {
+                        "error": "the session is busy with another reply; retry the edit",
+                        "code": "edit_resend_session_busy",
+                    },
+                    status=409,
+                )
+            try:
+                # Force the durability point endpoint-side: the sid clear lands
+                # in the session map's debounced writer, and a gateway exit
+                # before that write would resurrect the discarded conversation
+                # on restart.
+                await state.sessions.aflush()
+            except Exception:
+                logger.warning(
+                    "edit-resend: failed to flush the cleared resume sid for %s",
+                    session_key,
+                    exc_info=True,
+                )
+                state.push_slots_update()
+                return web.json_response(
+                    {
+                        "error": "could not prepare edited conversation; retry the edit",
+                        "code": "edit_resend_prepare_failed",
+                    },
+                    status=503,
+                )
+
+        # Persist the truncated+edited history via the explicit-snapshot
+        # rewrite path. Nothing was mutated on the live slot yet, so a failure
+        # (exception OR a save refused by its own guards) means nothing
+        # persisted: no live mutation and no dispatch. Unlike rewind, edit-resend
+        # has no queue-reservation machinery holding a competing send off the
+        # slot, so there is no committed-rewrite-without-dispatch window to
+        # shield against here -- a bare await is correct and kept simple.
         try:
-            msgs_snapshot = list(slot.messages)
-            await asyncio.to_thread(_save_slot_to_history, state, slot, msgs_snapshot)
+            saved = await asyncio.to_thread(
+                _save_slot_to_history,
+                state,
+                slot,
+                msgs_snapshot,
+                expected_history_key=expected_history_key,
+            )
         except Exception:
             logger.warning("edit-resend: failed to persist", exc_info=True)
+            state.push_slots_update()
+            return web.json_response(
+                {
+                    "error": "could not save edited conversation; retry the edit",
+                    "code": "edit_resend_save_failed",
+                },
+                status=503,
+            )
+        if not saved:
+            # The save's own guards refused the write (the session was
+            # permanently deleted, or the slot was rebound to another
+            # transcript, while the write awaited its lock). Nothing was
+            # persisted, so dispatching a turn now would run from state that
+            # exists only in memory.
+            logger.warning(
+                "edit-resend: history save refused for %s (concurrent delete or rebind)",
+                slot.key,
+            )
+            state.push_slots_update()
+            return web.json_response(
+                {
+                    "error": "could not save edited conversation; retry the edit",
+                    "code": "edit_resend_save_failed",
+                },
+                status=503,
+            )
+
+        # Both boundaries committed. Adopt the prepared state on the LIVE slot
+        # and dispatch the replacement turn. No await between the save above and
+        # these mutations, so they are atomic on the event loop.
+        slot.messages = prospective_slot.messages
+        slot.invalidate_source_links()
+        slot._dirty = True
+        slot._resumed_count = 0
 
         sel().log_api_access(
             caller="dashboard",

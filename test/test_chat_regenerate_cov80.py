@@ -33,9 +33,7 @@ def _make_regen_app(state) -> web.Application:
     app = web.Application()
     app["state"] = state
     app.router.add_post("/api/chat/slots/{slot}/regenerate", api_chat_slot_regenerate)
-    app.router.add_post(
-        "/api/chat/slots/{slot}/switch-variant", api_chat_slot_switch_variant
-    )
+    app.router.add_post("/api/chat/slots/{slot}/switch-variant", api_chat_slot_switch_variant)
     app.router.add_post("/api/chat/slots/{slot}/edit-resend", api_chat_slot_edit_resend)
     return app
 
@@ -46,6 +44,14 @@ def state(tmp_path, monkeypatch):
     st = _make_state(tmp_path)
     st.broadcast_ws = MagicMock()
     st.push_slots_update = MagicMock()
+    # edit-resend is now a real conversation boundary: it discards the native
+    # ACP conversation and flushes the cleared resume sid BEFORE persisting the
+    # truncated history. Configure the sessions double so the happy paths reach
+    # commit -- discard succeeds (returns True), the flush is a no-op, and the
+    # orphan-session lookup returns "" so no cleanup is attempted.
+    st.sessions.discard_conversation = AsyncMock(return_value=True)
+    st.sessions.aflush = AsyncMock()
+    st.sessions._session_map.get = MagicMock(return_value="")
     return st
 
 
@@ -124,10 +130,13 @@ async def test_regenerate_survives_a_history_write_failure(state, caplog) -> Non
     slot.append("assistant", "hello v1")
     slot.drain()
 
-    with patch(
-        "kiro_crew.dashboard.chat_regenerate._save_slot_to_history",
-        side_effect=OSError("disk full"),
-    ), patch("kiro_crew.dashboard.chat_regenerate._run_chat", new=AsyncMock()):
+    with (
+        patch(
+            "kiro_crew.dashboard.chat_regenerate._save_slot_to_history",
+            side_effect=OSError("disk full"),
+        ),
+        patch("kiro_crew.dashboard.chat_regenerate._run_chat", new=AsyncMock()),
+    ):
         with caplog.at_level("WARNING"):
             async with _client(state) as client:
                 resp = await client.post("/api/chat/slots/s1/regenerate")
@@ -248,9 +257,7 @@ async def test_switch_variant_rejected_while_a_turn_is_in_flight(state) -> None:
     await _busy(slot)
     try:
         async with _client(state) as client:
-            resp = await client.post(
-                "/api/chat/slots/s1/switch-variant", json={"index": 0}
-            )
+            resp = await client.post("/api/chat/slots/s1/switch-variant", json={"index": 0})
         assert resp.status == 409
     finally:
         slot.task.cancel()
@@ -292,9 +299,7 @@ async def test_switch_variant_survives_a_persist_failure(state, caplog) -> None:
     ):
         with caplog.at_level("WARNING"):
             async with _client(state) as client:
-                resp = await client.post(
-                    "/api/chat/slots/s1/switch-variant", json={"index": 0}
-                )
+                resp = await client.post("/api/chat/slots/s1/switch-variant", json={"index": 0})
 
     assert resp.status == 200
     assert "switch-variant: failed to persist" in caplog.text
@@ -483,25 +488,207 @@ async def test_edit_resend_readiness_latch_blocks_before_the_truncation(state) -
 
 
 @pytest.mark.asyncio
-async def test_edit_resend_survives_a_persist_failure(state, caplog) -> None:
+async def test_edit_resend_rejects_when_the_history_save_raises(state, caplog) -> None:
+    """A failed rewrite is now a retryable 503 (was log-and-continue 200): the
+    live slot is untouched and no replacement turn is dispatched from state that
+    was never persisted."""
     slot = state.get_or_create_slot("s1")
     slot.append("user", "first")
+    slot.append("assistant", "answer")
     slot.drain()
+    original_messages = list(slot.messages)
+    run = AsyncMock()
 
-    with patch(
-        "kiro_crew.dashboard.chat_regenerate._save_slot_to_history",
-        side_effect=OSError("disk full"),
-    ), patch("kiro_crew.dashboard.chat_regenerate._run_chat", new=AsyncMock()):
+    with (
+        patch(
+            "kiro_crew.dashboard.chat_regenerate._save_slot_to_history",
+            side_effect=OSError("disk full"),
+        ),
+        patch("kiro_crew.dashboard.chat_regenerate._run_chat", new=run),
+    ):
         with caplog.at_level("WARNING"):
             async with _client(state) as client:
                 resp = await client.post(
                     "/api/chat/slots/s1/edit-resend",
                     json={"index": 0, "content": "edited"},
                 )
-                assert resp.status == 200
+                assert resp.status == 503
+                assert (await resp.json())["code"] == "edit_resend_save_failed"
                 await asyncio.sleep(0)
 
     assert "edit-resend: failed to persist" in caplog.text
+    assert slot.messages == original_messages
+    run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_edit_resend_rejects_when_the_save_is_refused(state) -> None:
+    """A save refused by its own guards (returns False) must 503, not dispatch:
+    the session was deleted or the slot rebound while the write awaited its
+    lock, so nothing was persisted."""
+    slot = state.get_or_create_slot("s1")
+    slot.append("user", "first")
+    slot.append("assistant", "answer")
+    slot.drain()
+    original_messages = list(slot.messages)
+    run = AsyncMock()
+
+    with (
+        patch(
+            "kiro_crew.dashboard.chat_regenerate._save_slot_to_history",
+            MagicMock(return_value=False),
+        ),
+        patch("kiro_crew.dashboard.chat_regenerate._run_chat", new=run),
+    ):
+        async with _client(state) as client:
+            resp = await client.post(
+                "/api/chat/slots/s1/edit-resend",
+                json={"index": 0, "content": "edited"},
+            )
+            assert resp.status == 503
+            assert (await resp.json())["code"] == "edit_resend_save_failed"
+            await asyncio.sleep(0)
+
+    assert slot.messages == original_messages
+    run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_edit_resend_rejects_when_the_native_boundary_cannot_be_discarded(state) -> None:
+    """A failed discard leaves the original branch in place with a retryable
+    503 -- no history rewrite, no replacement turn."""
+    slot = state.get_or_create_slot("s1")
+    slot.append("user", "first")
+    slot.append("assistant", "answer")
+    slot.drain()
+    original_messages = list(slot.messages)
+    state.sessions.discard_conversation = AsyncMock(side_effect=OSError("map write failed"))
+    run = AsyncMock()
+
+    with (
+        patch("kiro_crew.dashboard.chat_regenerate._save_slot_to_history") as save,
+        patch("kiro_crew.dashboard.chat_regenerate._run_chat", new=run),
+    ):
+        async with _client(state) as client:
+            resp = await client.post(
+                "/api/chat/slots/s1/edit-resend",
+                json={"index": 0, "content": "edited"},
+            )
+            assert resp.status == 503
+            assert (await resp.json())["code"] == "edit_resend_prepare_failed"
+            await asyncio.sleep(0)
+
+    assert slot.messages == original_messages
+    save.assert_not_called()
+    run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_edit_resend_rejects_when_the_sid_flush_fails(state) -> None:
+    """The cleared resume sid must be durable before the commit: a flush failure
+    takes the same 503 prepare-failed path as a failed discard."""
+    slot = state.get_or_create_slot("s1")
+    slot.append("user", "first")
+    slot.append("assistant", "answer")
+    slot.drain()
+    original_messages = list(slot.messages)
+    state.sessions.aflush = AsyncMock(side_effect=OSError("map write failed"))
+    run = AsyncMock()
+
+    with (
+        patch("kiro_crew.dashboard.chat_regenerate._save_slot_to_history") as save,
+        patch("kiro_crew.dashboard.chat_regenerate._run_chat", new=run),
+    ):
+        async with _client(state) as client:
+            resp = await client.post(
+                "/api/chat/slots/s1/edit-resend",
+                json={"index": 0, "content": "edited"},
+            )
+            assert resp.status == 503
+            assert (await resp.json())["code"] == "edit_resend_prepare_failed"
+            await asyncio.sleep(0)
+
+    assert slot.messages == original_messages
+    state.sessions.discard_conversation.assert_awaited_once_with("dashboard:s1", skip_if_busy=True)
+    state.sessions.aflush.assert_awaited_once()
+    save.assert_not_called()
+    run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_edit_resend_refuses_a_busy_session_with_409(state) -> None:
+    """A busy native session (discard returns False, an inbound channel reply in
+    flight) must 409 with the slot untouched and no flush/save/dispatch."""
+    slot = state.get_or_create_slot("s1")
+    slot.append("user", "first")
+    slot.append("assistant", "answer")
+    slot.drain()
+    original_messages = list(slot.messages)
+    state.sessions.discard_conversation = AsyncMock(return_value=False)
+    run = AsyncMock()
+
+    with (
+        patch("kiro_crew.dashboard.chat_regenerate._save_slot_to_history") as save,
+        patch("kiro_crew.dashboard.chat_regenerate._run_chat", new=run),
+    ):
+        async with _client(state) as client:
+            resp = await client.post(
+                "/api/chat/slots/s1/edit-resend",
+                json={"index": 0, "content": "edited"},
+            )
+            assert resp.status == 409
+            assert (await resp.json())["code"] == "edit_resend_session_busy"
+            await asyncio.sleep(0)
+
+    assert slot.messages == original_messages
+    state.sessions.discard_conversation.assert_awaited_once_with("dashboard:s1", skip_if_busy=True)
+    state.sessions.aflush.assert_not_awaited()
+    save.assert_not_called()
+    run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_edit_resend_discards_the_native_conversation_before_persisting(state) -> None:
+    """The happy path clears the native conversation (once, skip_if_busy) BEFORE
+    the history save, and dispatches the edited turn only after both boundaries
+    commit."""
+    order: list[str] = []
+    slot = state.get_or_create_slot("s1")
+    slot.append("user", "first")
+    slot.append("assistant", "answer")
+    slot.drain()
+
+    async def _discard(key, **kwargs):
+        order.append(f"discard:{key}:{kwargs.get('skip_if_busy')}")
+        return True
+
+    state.sessions.discard_conversation = AsyncMock(side_effect=_discard)
+
+    def _save(*_args, **_kwargs):
+        order.append("save")
+        return True
+
+    run = AsyncMock()
+    with (
+        patch("kiro_crew.dashboard.chat_regenerate._save_slot_to_history", side_effect=_save),
+        patch("kiro_crew.dashboard.chat_regenerate._run_chat", new=run),
+    ):
+        async with _client(state) as client:
+            resp = await client.post(
+                "/api/chat/slots/s1/edit-resend",
+                json={"index": 0, "content": "edited"},
+            )
+            assert resp.status == 200
+            await asyncio.sleep(0)
+
+    # Discard the native conversation (exactly once) before persistence.
+    state.sessions.discard_conversation.assert_awaited_once_with("dashboard:s1", skip_if_busy=True)
+    assert order == ["discard:dashboard:s1:True", "save"]
+    # The live slot only adopts the edit after the boundaries commit.
+    assert [m["content"] for m in slot.messages] == ["edited"]
+    # The edited turn is dispatched after the commit.
+    run.assert_awaited_once()
+    assert run.await_args.args[2] == "edited"
 
 
 @pytest.mark.asyncio
