@@ -31,6 +31,7 @@ import { SourceBadge } from '../components/SourceBadge'
 import { errMessage } from '../utils/thunkError'
 import { EFFORT_LEVELS, effortLabel, modelSupportsEffort } from '../lib/effort'
 
+import { useConfirm } from '../components/ConfirmDialog'
 import { i18nT } from '../i18n/t'
 import ErrorNotice from '../components/ErrorNotice'
 /** Common shape returned by the agent/workspace mutation endpoints. */
@@ -813,6 +814,10 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
 
   const closeSheet = useCallback(() => { sheetEpoch.current += 1; setSheet(null); setError(''); setConfirmDelete(false) }, [])
 
+  /** Async discard confirm for the editor's dismissal paths. `confirmOpen` is
+   *  read below so a dismissal while the confirm is up does not re-ask. */
+  const { confirm, confirmDialog, confirmOpen } = useConfirm()
+
   /**
    * Identity of the CURRENT panel opening, bumped on every open and every
    * close.
@@ -1060,6 +1065,24 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     return out
   }, [editingAgent, kiroAgent, workspace, memoryStore, editModel, editEffort, triggers, sessionColor])
 
+  /**
+   * Guarded dismissal for the editor's Cancel / Escape / overlay-click paths.
+   *
+   * A successful save closes through settleFor/closeSheet directly and must
+   * never route here — only user-initiated dismissal is guarded. The create
+   * form's dirtiness is not tracked by dirtyPanes (scoped `!creating`, matching
+   * the unsaved-changes note in the footer), so it always closes immediately.
+   */
+  const attemptClose = useCallback(async () => {
+    if (creating || dirtyPanes.size === 0) { closeSheet(); return }
+    const discard = await confirm({
+      title: i18nT('pages.kiroCrewAgentsPage.discard_unsaved_changes'),
+      body: i18nT('pages.kiroCrewAgentsPage.discard_unsaved_body'),
+      confirmLabel: i18nT('pages.kiroCrewAgentsPage.discard_confirm'),
+    })
+    if (discard) closeSheet()
+  }, [creating, dirtyPanes, confirm, closeSheet])
+
   const sections = useCrewEditorSections({
     templateLabel: provider.labels.agentTemplateField,
     activeSchedules: wakeJobs.filter(j => j.enabled).length,
@@ -1245,7 +1268,15 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
         )}
       </div>
 
-      <Dialog open={!!sheet} onOpenChange={next => { if (!next) closeSheet() }}>
+      {/* While the discard confirm is open it owns Escape/outside-click; a
+          dismissal reaching the editor here would re-ask the guard the confirm
+          just raised, so it is ignored until the confirm settles.
+          modal is dropped while the confirm is up: the confirm is a body-portal
+          Modal outside this Radix DialogContent, so keeping Radix's focus scope
+          active would trap focus back onto Save behind the confirm and let
+          Enter persist the edits the confirm is asking to discard. Releasing
+          the scope hands focus to the confirm's own trap. */}
+      <Dialog open={!!sheet} modal={!confirmOpen} onOpenChange={next => { if (!next && !confirmOpen) attemptClose() }}>
         <DialogContent
           /* The rail needs horizontal room; the create form does not have one. */
           maxWidth={creating ? 560 : 790}
@@ -1501,7 +1532,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                 {i18nT('components.crewEditor.unsaved_changes')}
               </span>
             )}
-            <Btn onClick={closeSheet}>{i18nT('pages.kiroCrewAgentsPage.cancel')}</Btn>
+            <Btn onClick={attemptClose}>{i18nT('pages.kiroCrewAgentsPage.cancel')}</Btn>
             {creating ? (
               <SendBtn onClick={create} disabled={sheetBusy}>
                 {createMut.isPending ? i18nT('pages.kiroCrewAgentsPage.creating') : i18nT('pages.kiroCrewAgentsPage.create')}
@@ -1523,6 +1554,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
           />
         </DialogContent>
       </Dialog>
+      {confirmDialog}
     </>
   )
 }
