@@ -3674,7 +3674,30 @@ def _resolve_param_defaults(token: str) -> str:
 # ``-c`` may arrive inside a COMBINED short-flag cluster: ``bash -xc '<script>'``
 # and ``sh -ec '<script>'`` both run the next token as a script.  Matching only
 # the exact spellings ``-c``/``-lc`` leaves every other cluster as a bypass.
+# LOWERCASE only, deliberately: widening this class to ``[A-Za-z]`` made an
+# uppercase-clustered decoy (``-Cc``) the FIRST flag stop, which ate the stop
+# through which a following ``--command``'s payload was found (Opus review lane
+# on #8197).  Uppercase-clustered spellings are covered instead by
+# ``_SHELL_COMMAND_GLUED_RE`` (glued) and the every-carrier sweep (spaced), so
+# the flag stop set stays byte-identical to what it always was.
 _SHELL_COMMAND_FLAG_RE = re.compile(r"\A-[a-z]*c[a-z]*\Z")
+
+
+# ``-c`` takes a VALUE, so a getopt-convention shell (``ksh``, ``zsh``) ends
+# option parsing at the ``c`` and runs everything GLUED after it -- and the
+# reading is deliberately OVER-approximated for the shells whose own parsers
+# keep consuming cluster letters (bash's ``parse_shell_options``, dash's
+# ``options()``), because extraction must cover the strictest interpreter the
+# command could reach.  ``sh -c'rg . /path'`` reaches the token walk as
+# ``-crg . /path`` once ``shlex`` strips the quotes.  ``_SHELL_COMMAND_FLAG_RE``
+# anchors the WHOLE token as a bare flag cluster, so a token carrying the
+# payload's own characters was rejected and the payload never yielded (#8197).
+# This companion pattern CAPTURES the glued remainder instead of weakening the
+# flag pattern where it is used for pure flag detection.  Non-greedy, so the
+# split happens at the FIRST lowercase ``c`` (``-ec'x'`` runs ``x`` under the
+# getopt convention; the letters before the ``c`` are flags, either case:
+# ``-Cc'x'`` clusters noclobber before the ``c``).
+_SHELL_COMMAND_GLUED_RE = re.compile(r"\A-[A-Za-z]*?c(.+)\Z", re.DOTALL)
 
 
 # Variables that conventionally hold a shell (or the running script) path.  Piping
@@ -3787,14 +3810,69 @@ def _is_shell_command_flag(token: str) -> bool:
     return token == "--command" or bool(_SHELL_COMMAND_FLAG_RE.match(token))
 
 
-def _is_shell_command_flag_or_herestring(token: str) -> bool:
-    """True where the shell-program scan in :func:`_nested_shell_payloads` stops.
+def _glued_shell_command_payload(token: str) -> "str | None":
+    """The script glued onto a ``-c`` short-option cluster, or ``None``.
 
-    Exactly the three conditions that loop broke on, in one predicate: a command
-    flag, the spaced herestring operator, and the glued spelling.  Kept together so
-    the precomputed stop index and the handling at that index cannot drift apart.
+    The quoted spellings (``-c'x'``, ``-c"x"``) normally lose their quotes to
+    ``shlex`` before tokens reach here, but the fallback tokenizer keeps them, so
+    one surviving outer quote layer is removed -- the payload comes back exactly
+    as the spaced ``-c 'x'`` spelling would deliver it.  Only a layer that is
+    provably a WRAPPER is removed: when the quote character also occurs inside
+    the payload, the first and last characters may be two unrelated quotes
+    (``'a' 'b'``), and stripping them would corrupt the reading.
     """
-    return _is_shell_command_flag(token) or token == "<<<" or token.startswith("<<<")
+    match = _SHELL_COMMAND_GLUED_RE.match(token)
+    if match is None:
+        return None
+    payload = match.group(1)
+    if (
+        len(payload) >= 2
+        and payload[0] == payload[-1]
+        and payload[0] in "'\""
+        and payload[0] not in payload[1:-1]
+    ):
+        payload = payload[1:-1]
+    return payload or None
+
+
+def _is_glued_shell_command_token(token: str) -> bool:
+    """True where the glued ``-c`` scan in :func:`_nested_shell_payloads` stops."""
+    return _glued_shell_command_payload(token) is not None
+
+
+def _shell_c_carrier_glued(token: str) -> "str | None":
+    """The remainder after the first lowercase ``c`` of a short-option carrier.
+
+    The LOOSE recognition: ANY characters may precede the ``c`` (``-1c…``, a
+    long cluster like ``-onoclobber`` glued ahead of it), because a
+    getopt-convention parser consumes unknown letters rather than stopping, and
+    because extraction deliberately over-approximates -- a junk payload
+    re-tokenizes to text that matches no rule, while a missed one is a command
+    nothing examines.  Returns ``""`` for a bare carrier (the payload is the
+    NEXT token), or ``None`` when *token* is not a carrier at all.  This is the
+    recognition the alt-traversal pass's deleted local extractor used; both the
+    every-carrier sweep in :func:`_nested_shell_payloads` and the positional
+    binding in :func:`_alt_bound_shell_payloads` share it so they cannot drift.
+    """
+    if not token.startswith("-") or token.startswith("--") or len(token) < 2:
+        return None
+    position = token.find("c", 1)
+    if position == -1:
+        return None
+    return token[position + 1 :]
+
+
+def _is_herestring_token(token: str) -> bool:
+    """True where the herestring scan in :func:`_nested_shell_payloads` stops.
+
+    Covers the spaced operator and the operator glued to its payload.  A
+    SEPARATE stop from the command flag (they used to share one predicate):
+    with one shared table a herestring token EATS the stop through which a
+    later ``-c``'s payload was found -- ``bash <<<'x' -c '<script>'`` yielded
+    only ``x`` while a real shell runs the script.  Independent tables scan
+    each spelling in its own right, which is purely additive.
+    """
+    return token == "<<<" or token.startswith("<<<")
 
 
 def _is_env_split_flag(token: str) -> bool:
@@ -3868,8 +3946,35 @@ def _nested_shell_payloads(
     # backward pass instead, which makes the whole function O(N) while returning the
     # identical payload list -- the loops' only exits were that first stop token or the
     # end of the list, so nothing else can change.
-    shell_stop = _next_stop_indexes(tokens, _is_shell_command_flag_or_herestring)
+    flag_stop = _next_stop_indexes(tokens, _is_shell_command_flag)
     env_stop = _next_stop_indexes(tokens, _is_env_split_flag)
+    # The herestring and the GLUED ``-c`` spelling each get their OWN stop table
+    # rather than sharing the flag's: with a shared table, whichever spelling
+    # comes first EATS the stop through which a later spelling's payload was
+    # found -- ``bash <<<'x' -c '<script>'`` yielded only ``x``.  Splitting the
+    # tables fixes the CROSS-spelling case; WITHIN one class each table still
+    # reads only its first stop per shell token, which for short-cluster ``-c``
+    # carriers is closed by the every-carrier sweep at the bottom of this
+    # function.  Two stated residuals: ``--command`` carriers stay
+    # first-stop-only (the sweep is scoped to short clusters), and herestrings
+    # keep a first-occurrence residual (``bash <<<'a' <<<'b'`` yields ``a``; a
+    # real shell applies the LAST redirect).
+    herestring_stop = _next_stop_indexes(tokens, _is_herestring_token)
+    # Each token's OWN glued payload is extracted exactly once, up front.  The
+    # lookups below run per shell token, and many shell tokens can share one
+    # stop index -- re-extracting there copies the same length-M substring once
+    # per shell token, O(N*M) time and memory on ``["bash"]*N + ["-c<payload>"]``
+    # (found by the GPT 5.6 review lane on this change).  Appending the CACHED
+    # string keeps every later append a reference to one object, whose hash
+    # Python also computes once, so the dedup sets downstream stay linear too.
+    # The herestring tail gets the same cache for the same reason.
+    glued_payloads = [_glued_shell_command_payload(token) for token in tokens]
+    glued_stop = [len(tokens)] * (len(tokens) + 1)
+    for back in range(len(tokens) - 1, -1, -1):
+        glued_stop[back] = back if glued_payloads[back] is not None else glued_stop[back + 1]
+    herestring_tails = [
+        token[3:] if token != "<<<" and token.startswith("<<<") else None for token in tokens
+    ]
     # ``--`` runs are precomputed for the same reason: a long run of them after the
     # command flag is walked once per program token otherwise, which is quadratic even
     # though the two scans above are not.
@@ -3883,22 +3988,36 @@ def _nested_shell_payloads(
         # payload exactly as a named shell does.  The recognizer already used for the
         # ``| $SHELL`` evaluator sink applies here too.
         if base in _NESTED_SHELL_PROGRAMS or _is_shell_variable_reference(token):
-            j = shell_stop[i + 1]
+            j = flag_stop[i + 1]
             if j < limit:
-                if _is_shell_command_flag(tokens[j]):
-                    # ``bash -c -- '<script>'`` is legal: ``--`` ends option parsing
-                    # and the script is the token AFTER it.  Skip any run of them.
-                    k = past_dashes[j + 1]
-                    if k < limit:
-                        payloads.append(tokens[k])
-                # A HERESTRING feeds the script on stdin instead of as an argument
-                # (``bash <<< '<script>'``), so its text is a command just the same.
-                # Both the spaced and glued spellings arrive here.
-                elif tokens[j] == "<<<":
-                    if j + 1 < limit:
-                        payloads.append(tokens[j + 1])
-                elif tokens[j].startswith("<<<"):
-                    payloads.append(tokens[j][3:])
+                # ``bash -c -- '<script>'`` is legal: ``--`` ends option parsing
+                # and the script is the token AFTER it.  Skip any run of them.
+                k = past_dashes[j + 1]
+                if k < limit:
+                    payloads.append(tokens[k])
+            # A HERESTRING feeds the script on stdin instead of as an argument
+            # (``bash <<< '<script>'``), so its text is a command just the same.
+            # Both the spaced and glued spellings arrive here.
+            h = herestring_stop[i + 1]
+            if h < limit:
+                if tokens[h] == "<<<":
+                    if h + 1 < limit:
+                        payloads.append(tokens[h + 1])
+                else:
+                    tail = herestring_tails[h]
+                    if tail is not None:
+                        payloads.append(tail)
+            # The glued ``-c`` spelling (``-c'<script>'``, one token once shlex
+            # strips the quotes) is looked up independently as well.  An
+            # all-alpha cluster like ``-ecfoo`` satisfies BOTH ``-c`` readings --
+            # it matches the bare-flag pattern (yielding the next token, as
+            # before) AND carries a glued remainder a real shell would run -- so
+            # both payloads are yielded rather than picking one interpretation.
+            g = glued_stop[i + 1]
+            if g < limit:
+                glued = glued_payloads[g]
+                if glued is not None:
+                    payloads.append(glued)
         elif base in _ENV_SPLIT_PROGRAMS:
             # ``env -S '<script>'`` / ``env --split-string '<script>'`` splits the
             # payload into a command and runs it, so its text is a command line.
@@ -3957,6 +4076,40 @@ def _nested_shell_payloads(
         head, _, tail = token.partition("<<<")
         if tail and _program_basename(head) in _NESTED_SHELL_PROGRAMS:
             payloads.append(tail)
+    # EVERY ``-c`` carrier past the first shell token is swept, not only the
+    # first-stop one.  The stop tables above read one token per spelling class,
+    # so a decoy that satisfies the same predicate EATS the stop through which a
+    # later carrier's payload was found (``ksh -onoclobber -c'<script>'`` stops
+    # the glued table at ``-onoclobber``; ``bash -c 'a' -c '<script>'`` stops the
+    # flag table at the first ``-c``).  The loose recognition here is the one the
+    # alt-traversal pass's deleted local extractor used -- any prefix before the
+    # first lowercase ``c`` (``-1c…``), payload glued or in the next token -- and
+    # the sweep is a single forward pass from the first shell token, so the
+    # function stays O(N).  Additive only: a payload already collected above is
+    # not re-appended, so consumers pinning exact payload lists are unchanged.
+    first_shell = next(
+        (
+            i
+            for i, token in enumerate(tokens)
+            if _program_basename(token) in _NESTED_SHELL_PROGRAMS
+            or _is_shell_variable_reference(token)
+        ),
+        None,
+    )
+    if first_shell is not None:
+        collected = set(payloads)
+        for index in range(first_shell + 1, limit):
+            glued = _shell_c_carrier_glued(tokens[index])
+            if glued is None:
+                continue
+            if glued:
+                candidate: "str | None" = glued
+            else:
+                k = past_dashes[index + 1]
+                candidate = tokens[k] if k < limit else None
+            if candidate and candidate not in collected:
+                collected.add(candidate)
+                payloads.append(candidate)
     # ``a=(<name> <verb>); "${a[@]}"`` runs the array's elements AS a command line.  The
     # expansion is one token, so the argv checks have no adjacent operands to compare --
     # the joined elements are handed to the payload walk instead, which re-tokenizes them.
@@ -15407,24 +15560,42 @@ def _alt_command_string_payloads(
 
     :func:`_nested_shell_payloads` -- the extractor the self-protection floor
     already uses -- is unioned in rather than replaced by the scan above, because
-    the two cover different spellings and a payload missed is a traversal never
-    looked at. It adds a shell reached through a variable (``$SHELL -c``), a
-    herestring (``bash <<< '…'``), a payload after ``-c --``, an array expansion run
-    as a command line, GNU ``sed``'s ``s///e`` replacement, and a multiword alias.
-    The scan above adds the one it declines: a payload GLUED to a short cluster
-    (``sh -c'rg . …'``), whose token holds characters its flag pattern rejects.
-    Extracting text that turns out not to be a command costs nothing here -- it
-    re-tokenizes to stages that match no traversal rule. The result is de-duplicated
-    because the two extractors agree on most spellings, and re-staging one payload
-    twice doubles the walk below it for no new reading.
+    it reaches spellings a resolved-program scan does not: a shell reached
+    through a variable (``$SHELL -c``), a herestring (``bash <<< '…'``), a
+    payload after ``-c --``, an array expansion run as a command line, GNU
+    ``sed``'s ``s///e`` replacement, and a multiword alias.  The scan above adds
+    what the shared extractor cannot know: a program name that only resolves
+    through a local ASSIGNMENT (``S=sh; "$S" -c '…'``), and the POSITIONAL
+    parameters a shell binds after the command string.  Extraction itself is the
+    shared extractor's in both directions -- the resolved-program branch re-runs
+    it with the resolved name substituted, so one extractor remains and the two
+    passes cannot drift (#8197 folded the glued ``-c'…'`` spelling, previously a
+    local scan here, into the shared extractor).  Extracting text that turns out
+    not to be a command costs nothing here -- it re-tokenizes to stages that
+    match no traversal rule. The result is de-duplicated because the extractors
+    agree on most spellings, and re-staging one payload twice doubles the walk
+    below it for no new reading.
     """
     payloads: list[str] = list(_nested_shell_payloads(tokens))
+    substituted: list[str] = []
+    resolved_a_shell = False
     for index, token in enumerate(tokens):
         # Resolved, not literal: `S=sh; "$S" -c '…'` carries a payload and the
         # literal `$S` named no shell.
         program = _alt_resolved_program_word(token, assignments or {})
         if program in _NESTED_SHELL_PROGRAMS:
-            payloads.extend(_alt_shell_c_payloads(tokens[index + 1 :]))
+            payloads.extend(_alt_bound_shell_payloads(tokens[index + 1 :]))
+            # Substitute the resolved name IN PLACE when the shared extractor
+            # could not have seen this token as a shell itself (an assignment, a
+            # case difference, or a Windows ``.exe`` suffix resolved it), and
+            # re-run the extractor ONCE on the substituted list below.  Re-running
+            # it per resolved token multiplied its full cost by the number of
+            # such tokens; one substituted call reads every carrier past the
+            # first shell, which is what the per-token calls were deriving.
+            if _program_basename(token) not in _NESTED_SHELL_PROGRAMS:
+                resolved_a_shell = True
+                substituted.append(program)
+                continue
         elif program in _ENV_SPLIT_PROGRAMS:
             payloads.extend(_alt_env_s_payloads(tokens[index + 1 :]))
         elif program in _NESTED_SHELL_VERBS:
@@ -15436,6 +15607,9 @@ def _alt_command_string_payloads(
             operands = [word for word in tokens[index + 1 :] if not word.startswith("-")]
             if operands:
                 payloads.append(" ".join(operands))
+        substituted.append(token)
+    if resolved_a_shell:
+        payloads.extend(_nested_shell_payloads(substituted))
     deduped: list[str] = []
     for payload in payloads:
         if payload not in deduped:
@@ -15443,37 +15617,32 @@ def _alt_command_string_payloads(
     return deduped
 
 
-def _alt_shell_c_payloads(argv: list[str]) -> list[str]:
-    """The command strings a shell's ``-c`` carries, in every spelling of it.
+def _alt_bound_shell_payloads(argv: list[str]) -> list[str]:
+    """The ``-c`` command strings in *argv* with POSITIONAL parameters bound.
 
-    ``-c`` takes a value, so it ends a short-option cluster: the command is either
-    glued onto the cluster (``-c'cmd'``) or the next word (``-c 'cmd'``,
-    ``-lc 'cmd'``).
+    EXTRACTION lives in :func:`_nested_shell_payloads` (one extractor -- #8197);
+    this adds only the reading that pass needs on top of it: the words after a
+    shell's command string are what the shell binds as ``$0``/``$1``…, so a
+    payload referencing a positional gets a second, bound reading
+    (``sh -c 'rg . "$1"' _ <root>`` names its root only in that reading).
+    Locating the command string reuses the shared extractor's own loose carrier
+    recognition (:func:`_shell_c_carrier_glued`), so what is bound here and what
+    is extracted there cannot drift apart.
     """
     payloads: list[str] = []
     for index, token in enumerate(argv):
-        if token.startswith("--"):
+        glued = _shell_c_carrier_glued(token)
+        if glued is None:
             continue
-        if not token.startswith("-") or len(token) < 2:
-            continue
-        cluster = token[1:]
-        position = cluster.find("c")
-        if position == -1:
-            continue
-        glued = cluster[position + 1 :]
         if glued:
-            payloads.append(glued)
             bound = _alt_positional_bound_payload(glued, argv[index + 1 :])
-            if bound:
-                payloads.append(bound)
         elif index + 1 < len(argv):
-            payloads.append(argv[index + 1])
             # The words AFTER the command string are its positional parameters.
-            bound = _alt_positional_bound_payload(
-                argv[index + 1], argv[index + 2 :]
-            )
-            if bound:
-                payloads.append(bound)
+            bound = _alt_positional_bound_payload(argv[index + 1], argv[index + 2 :])
+        else:
+            bound = None
+        if bound:
+            payloads.append(bound)
     return payloads
 
 
