@@ -54,12 +54,10 @@ def selinuxfs(tmp_path, monkeypatch):
 
 @pytest.fixture
 def policy(monkeypatch):
-    """Control ``compute_av``'s answer without touching a kernel interface."""
+    """Control ``_compute_av``'s answer without touching a kernel interface."""
 
     def configure(allowed: int, flags: int = 0):
-        monkeypatch.setattr(
-            sel, "compute_av", lambda _s, _t, _c: (allowed, flags)
-        )
+        monkeypatch.setattr(sel, "_compute_av", lambda _s, _t, _c: (allowed, flags))
 
     return configure
 
@@ -68,21 +66,21 @@ class TestEnforcingDetection:
     """Only an actively enforcing kernel can turn a denial into a start failure."""
 
     def test_enforce_one_is_enforcing(self, selinuxfs):
-        assert sel.selinux_is_enforcing() is True
+        assert sel._is_enforcing() is True
 
     def test_permissive_is_not_enforcing(self, selinuxfs):
         """In permissive mode the denial is logged and the execve succeeds."""
         (selinuxfs / "enforce").write_text("0")
-        assert sel.selinux_is_enforcing() is False
+        assert sel._is_enforcing() is False
 
     def test_absent_selinuxfs_is_not_enforcing(self, selinuxfs):
         """No SELinux at all — the overwhelmingly common case — must read False."""
         (selinuxfs / "enforce").unlink()
-        assert sel.selinux_is_enforcing() is False
+        assert sel._is_enforcing() is False
 
     def test_unparseable_enforce_is_not_enforcing(self, selinuxfs):
         (selinuxfs / "enforce").write_text("banana")
-        assert sel.selinux_is_enforcing() is False
+        assert sel._is_enforcing() is False
 
 
 class TestLabelReading:
@@ -100,14 +98,24 @@ class TestLabelReading:
         def refuse(*_a):
             raise OSError("xattr not supported")
 
-        monkeypatch.setattr(sel.os, "getxattr", refuse)
+        # raising=False: os.getxattr is Linux-only and absent on Windows, where
+        # this file is still collected. Setting it there is exactly right — the
+        # parse logic under test is platform-independent, and _file_context()
+        # reaches it through getattr(os, "getxattr", None).
+        monkeypatch.setattr(sel.os, "getxattr", refuse, raising=False)
         target = tmp_path / "kirocrew"
         target.write_text("#!/bin/sh\n")
-        assert sel.file_context(str(target)) is None
+        assert sel._file_context(str(target)) is None
 
     def test_absent_path_reads_as_no_label(self, tmp_path):
-        assert sel.file_context(str(tmp_path / "nope")) is None
+        assert sel._file_context(str(tmp_path / "nope")) is None
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="symlink creation needs privilege on Windows and realpath anchors "
+        "a POSIX path to a drive letter, so neither the setup nor the asserted "
+        "path is meaningful there; the module only ever runs on Linux",
+    )
     def test_label_is_read_through_a_symlink_chain(self, tmp_path, monkeypatch):
         """~/.local/bin/kirocrew is a symlink to the venv entry point.
 
@@ -127,19 +135,17 @@ class TestLabelReading:
             assert name == "security.selinux"
             return HOME_T.encode() + b"\x00"
 
-        monkeypatch.setattr(sel.os, "getxattr", fake_getxattr)
-        assert sel.file_context(str(link)) == HOME_T
+        monkeypatch.setattr(sel.os, "getxattr", fake_getxattr, raising=False)
+        assert sel._file_context(str(link)) == HOME_T
         assert seen == [str(real)], "must read the resolved target's label"
 
     def test_trailing_nul_is_stripped(self, tmp_path, monkeypatch):
         """The kernel NUL-terminates the value; a bare strip leaves it behind
         and the policy query would then fail to parse the context."""
-        monkeypatch.setattr(
-            sel.os, "getxattr", lambda *_a: BIN_T.encode() + b"\x00"
-        )
+        monkeypatch.setattr(sel.os, "getxattr", lambda *_a: BIN_T.encode() + b"\x00", raising=False)
         target = tmp_path / "kirocrew"
         target.write_text("x")
-        assert sel.file_context(str(target)) == BIN_T
+        assert sel._file_context(str(target)) == BIN_T
 
 
 class TestPermBitDecoding:
@@ -167,12 +173,10 @@ class TestBlocksSystemUnit:
         path.chmod(0o755)
         return str(path)
 
-    def test_fires_when_policy_denies_execute(
-        self, selinuxfs, policy, monkeypatch, tmp_path
-    ):
+    def test_fires_when_policy_denies_execute(self, selinuxfs, policy, monkeypatch, tmp_path):
         binary = self._binary(tmp_path)
-        monkeypatch.setattr(sel, "system_manager_context", lambda: INIT_T)
-        monkeypatch.setattr(sel, "file_context", lambda _p: HOME_T)
+        monkeypatch.setattr(sel, "_system_manager_context", lambda: INIT_T)
+        monkeypatch.setattr(sel, "_file_context", lambda _p: HOME_T)
         # getattr allowed, execute NOT — the exact shape that makes the file look
         # fine to every ordinary check while systemd still gets 203/EXEC.
         policy(GETATTR_MASK)
@@ -193,20 +197,18 @@ class TestBlocksSystemUnit:
         issue reports. Matching on the reported type name would have missed it.
         """
         other_label = "unconfined_u:object_r:default_t:s0"
-        monkeypatch.setattr(sel, "system_manager_context", lambda: INIT_T)
-        monkeypatch.setattr(sel, "file_context", lambda _p: other_label)
+        monkeypatch.setattr(sel, "_system_manager_context", lambda: INIT_T)
+        monkeypatch.setattr(sel, "_file_context", lambda _p: other_label)
         policy(GETATTR_MASK)
 
         blocked, reason = sel.blocks_system_unit(self._binary(tmp_path))
         assert blocked is True
         assert other_label in reason
 
-    def test_quiet_when_policy_allows_execute(
-        self, selinuxfs, policy, monkeypatch, tmp_path
-    ):
+    def test_quiet_when_policy_allows_execute(self, selinuxfs, policy, monkeypatch, tmp_path):
         binary = self._binary(tmp_path)
-        monkeypatch.setattr(sel, "system_manager_context", lambda: INIT_T)
-        monkeypatch.setattr(sel, "file_context", lambda _p: BIN_T)
+        monkeypatch.setattr(sel, "_system_manager_context", lambda: INIT_T)
+        monkeypatch.setattr(sel, "_file_context", lambda _p: BIN_T)
         policy(GETATTR_MASK | EXECUTE_MASK)
 
         blocked, reason = sel.blocks_system_unit(binary)
@@ -216,59 +218,58 @@ class TestBlocksSystemUnit:
     def test_quiet_when_not_enforcing(self, selinuxfs, policy, monkeypatch, tmp_path):
         """Permissive: the denial is logged, the unit starts. Must not refuse."""
         (selinuxfs / "enforce").write_text("0")
-        monkeypatch.setattr(sel, "system_manager_context", lambda: INIT_T)
-        monkeypatch.setattr(sel, "file_context", lambda _p: HOME_T)
+        monkeypatch.setattr(sel, "_system_manager_context", lambda: INIT_T)
+        monkeypatch.setattr(sel, "_file_context", lambda _p: HOME_T)
         policy(GETATTR_MASK)
 
         blocked, reason = sel.blocks_system_unit(self._binary(tmp_path))
         assert blocked is False
         assert "not enforcing" in reason
 
-    def test_quiet_when_source_domain_is_permissive(
-        self, selinuxfs, policy, monkeypatch, tmp_path
-    ):
+    def test_quiet_when_source_domain_is_permissive(self, selinuxfs, policy, monkeypatch, tmp_path):
         """A per-domain permissive source still executes despite the denial.
 
         Global mode is enforcing here, so only the reply's flags word
         distinguishes this from a real failure.
         """
-        monkeypatch.setattr(sel, "system_manager_context", lambda: INIT_T)
-        monkeypatch.setattr(sel, "file_context", lambda _p: HOME_T)
+        monkeypatch.setattr(sel, "_system_manager_context", lambda: INIT_T)
+        monkeypatch.setattr(sel, "_file_context", lambda _p: HOME_T)
         policy(GETATTR_MASK, flags=sel._AVD_FLAG_PERMISSIVE)
 
         blocked, _ = sel.blocks_system_unit(self._binary(tmp_path))
         assert blocked is False
 
-    def test_quiet_when_pid1_context_is_unreadable(
-        self, selinuxfs, policy, monkeypatch, tmp_path
-    ):
-        monkeypatch.setattr(sel, "system_manager_context", lambda: None)
+    def test_quiet_when_pid1_context_is_unreadable(self, selinuxfs, policy, monkeypatch, tmp_path):
+        monkeypatch.setattr(sel, "_system_manager_context", lambda: None)
         policy(GETATTR_MASK)
         blocked, reason = sel.blocks_system_unit(self._binary(tmp_path))
         assert blocked is False
         assert "system manager" in reason
 
-    def test_quiet_when_the_file_has_no_label(
-        self, selinuxfs, policy, monkeypatch, tmp_path
-    ):
+    def test_quiet_when_the_file_has_no_label(self, selinuxfs, policy, monkeypatch, tmp_path):
         """An unlabelled or unreadable path yields no verdict, so no refusal."""
-        monkeypatch.setattr(sel, "system_manager_context", lambda: INIT_T)
-        monkeypatch.setattr(sel, "file_context", lambda _p: None)
+        monkeypatch.setattr(sel, "_system_manager_context", lambda: INIT_T)
+        monkeypatch.setattr(sel, "_file_context", lambda _p: None)
         policy(GETATTR_MASK)
         blocked, _ = sel.blocks_system_unit(self._binary(tmp_path))
         assert blocked is False
 
     def test_quiet_when_the_policy_query_fails(self, selinuxfs, monkeypatch, tmp_path):
-        """A kernel that refuses compute_av must not be read as a denial."""
-        monkeypatch.setattr(sel, "system_manager_context", lambda: INIT_T)
-        monkeypatch.setattr(sel, "file_context", lambda _p: HOME_T)
-        monkeypatch.setattr(sel, "compute_av", lambda *_a: None)
+        """A kernel that refuses _compute_av must not be read as a denial."""
+        monkeypatch.setattr(sel, "_system_manager_context", lambda: INIT_T)
+        monkeypatch.setattr(sel, "_file_context", lambda _p: HOME_T)
+        monkeypatch.setattr(sel, "_compute_av", lambda *_a: None)
         blocked, _ = sel.blocks_system_unit(self._binary(tmp_path))
         assert blocked is False
 
-    def test_fires_on_a_denied_shebang_interpreter(
-        self, selinuxfs, policy, monkeypatch, tmp_path
-    ):
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="a shebang is a POSIX exec mechanism and the interpreter path it "
+        "names is required to be absolute-POSIX; on Windows tmp_path yields "
+        "C:\\... so _interpreter_of correctly declines it and there is nothing "
+        "to assert",
+    )
+    def test_fires_on_a_denied_shebang_interpreter(self, selinuxfs, policy, monkeypatch, tmp_path):
         """The entry point is a script naming a venv interpreter under $HOME.
 
         Checking only the script would pass a case that still fails at the
@@ -280,20 +281,18 @@ class TestBlocksSystemUnit:
         interpreter.write_bytes(b"\x7fELF")
         script = self._binary(tmp_path, shebang=f"#!{interpreter}")
 
-        monkeypatch.setattr(sel, "system_manager_context", lambda: INIT_T)
+        monkeypatch.setattr(sel, "_system_manager_context", lambda: INIT_T)
         # The script itself is fine; only the interpreter is home-labelled.
         monkeypatch.setattr(
             sel,
-            "file_context",
+            "_file_context",
             lambda p: HOME_T if p == str(interpreter) else BIN_T,
         )
         monkeypatch.setattr(
             sel,
-            "compute_av",
+            "_compute_av",
             lambda _s, target, _c: (
-                (GETATTR_MASK, 0)
-                if target == HOME_T
-                else (GETATTR_MASK | EXECUTE_MASK, 0)
+                (GETATTR_MASK, 0) if target == HOME_T else (GETATTR_MASK | EXECUTE_MASK, 0)
             ),
         )
 
@@ -328,35 +327,29 @@ class TestComputeAvQuery:
             return "220990 ffffffff 0 ffffffff 1 0"
 
         monkeypatch.setattr(sel, "_query_access", fake_query)
-        assert sel.compute_av(INIT_T, HOME_T, "file") == (0x220990, 0)
+        assert sel._compute_av(INIT_T, HOME_T, "file") == (0x220990, 0)
         # class id 6 from the faked index; ffffffff asks for the full vector.
         assert asked == [f"{INIT_T} {HOME_T} 6 ffffffff"]
 
-    def test_permissive_flag_is_taken_from_the_last_field(
-        self, selinuxfs, monkeypatch
-    ):
+    def test_permissive_flag_is_taken_from_the_last_field(self, selinuxfs, monkeypatch):
         """flags is field 6, not field 5 — an off-by-one here would silently
         read seqno as the permissive bit and disable the whole gate."""
-        monkeypatch.setattr(
-            sel, "_query_access", lambda _q: "220990 ffffffff 0 ffffffff 7 1"
-        )
-        assert sel.compute_av(INIT_T, HOME_T, "file") == (0x220990, 1)
+        monkeypatch.setattr(sel, "_query_access", lambda _q: "220990 ffffffff 0 ffffffff 7 1")
+        assert sel._compute_av(INIT_T, HOME_T, "file") == (0x220990, 1)
 
     def test_truncated_reply_is_no_answer(self, selinuxfs, monkeypatch):
         monkeypatch.setattr(sel, "_query_access", lambda _q: "220990 ffffffff")
-        assert sel.compute_av(INIT_T, HOME_T, "file") is None
+        assert sel._compute_av(INIT_T, HOME_T, "file") is None
 
     def test_non_hex_reply_is_no_answer(self, selinuxfs, monkeypatch):
         """A reply shaped right but not parseable must not become a verdict."""
-        monkeypatch.setattr(
-            sel, "_query_access", lambda _q: "zzz ffffffff 0 ffffffff 1 0"
-        )
-        assert sel.compute_av(INIT_T, HOME_T, "file") is None
+        monkeypatch.setattr(sel, "_query_access", lambda _q: "zzz ffffffff 0 ffffffff 1 0")
+        assert sel._compute_av(INIT_T, HOME_T, "file") is None
 
     def test_unavailable_transport_is_no_answer(self, selinuxfs, monkeypatch):
-        """A kernel that refuses compute_av, or no selinuxfs at all."""
+        """A kernel that refuses _compute_av, or no selinuxfs at all."""
         monkeypatch.setattr(sel, "_query_access", lambda _q: None)
-        assert sel.compute_av(INIT_T, HOME_T, "file") is None
+        assert sel._compute_av(INIT_T, HOME_T, "file") is None
 
     def test_unopenable_access_node_yields_no_reply(self, selinuxfs):
         """The real transport against a path that does not exist."""
@@ -365,29 +358,29 @@ class TestComputeAvQuery:
     def test_missing_class_index_is_no_answer(self, selinuxfs, monkeypatch):
         monkeypatch.setattr(sel, "_query_access", lambda _q: "0 0 0 0 0 0")
         (selinuxfs / "class" / "file" / "index").unlink()
-        assert sel.compute_av(INIT_T, HOME_T, "file") is None
+        assert sel._compute_av(INIT_T, HOME_T, "file") is None
 
 
 class TestUserScopeUnitRendering:
     """The remedy is rendered by the real renderer, so it cannot drift."""
 
     @staticmethod
-    def _render(monkeypatch, scope):
+    def _render(monkeypatch, user_scope):
         monkeypatch.setenv("USER", "tester")
         with patch(
             "kiro_crew.service.common.shutil.which",
             return_value="/home/tester/.local/bin/kirocrew",
         ):
-            return svc_linux.render_unit(scope=scope)
+            return svc_linux.render_unit(user_scope=user_scope)
 
     def test_user_unit_omits_user_and_group(self, monkeypatch):
         """A user manager rejects User=/Group=, making the unit unloadable."""
-        unit = self._render(monkeypatch, svc_linux.USER_SCOPE)
+        unit = self._render(monkeypatch, True)
         assert "\nUser=" not in unit
         assert "\nGroup=" not in unit
 
     def test_system_unit_still_carries_user_and_group(self, monkeypatch):
-        unit = self._render(monkeypatch, svc_linux.SYSTEM_SCOPE)
+        unit = self._render(monkeypatch, False)
         assert "\nUser=tester\n" in unit
         assert "\nGroup=" in unit
 
@@ -398,24 +391,22 @@ class TestUserScopeUnitRendering:
             "kiro_crew.service.common.shutil.which",
             return_value="/home/tester/.local/bin/kirocrew",
         ):
-            assert svc_linux.render_unit() == svc_linux.render_unit(
-                scope=svc_linux.SYSTEM_SCOPE
-            )
+            assert svc_linux.render_unit() == svc_linux.render_unit(user_scope=False)
 
     def test_user_unit_wants_default_target(self, monkeypatch):
         """multi-user.target is a system target the user manager does not have."""
-        unit = self._render(monkeypatch, svc_linux.USER_SCOPE)
+        unit = self._render(monkeypatch, True)
         assert "WantedBy=default.target" in unit
         assert "multi-user.target" not in unit
 
     def test_system_unit_wants_multi_user_target(self, monkeypatch):
-        unit = self._render(monkeypatch, svc_linux.SYSTEM_SCOPE)
+        unit = self._render(monkeypatch, False)
         assert "WantedBy=multi-user.target" in unit
 
     def test_both_scopes_share_exec_start_and_environment(self, monkeypatch):
         """The pasted unit must run the same thing with the same environment."""
-        system = self._render(monkeypatch, svc_linux.SYSTEM_SCOPE)
-        user = self._render(monkeypatch, svc_linux.USER_SCOPE)
+        system = self._render(monkeypatch, False)
+        user = self._render(monkeypatch, True)
         exec_line = [ln for ln in system.splitlines() if ln.startswith("ExecStart=")]
         assert exec_line and exec_line[0] in user.splitlines()
         for line in system.splitlines():
@@ -441,12 +432,13 @@ class TestInstallRefusesAnUnstartableSystemUnit:
         self._blocked(monkeypatch)
         ok = MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch(
-            "kiro_crew.service.common.shutil.which",
-            return_value="/home/tester/.local/bin/kirocrew",
-        ), patch(
-            "kiro_crew.service.linux.subprocess.run", return_value=ok
-        ) as run:
+        with (
+            patch(
+                "kiro_crew.service.common.shutil.which",
+                return_value="/home/tester/.local/bin/kirocrew",
+            ),
+            patch("kiro_crew.service.linux.subprocess.run", return_value=ok) as run,
+        ):
             with pytest.raises(svc_linux.ServiceInstallError) as exc:
                 svc_linux.install()
 
@@ -471,7 +463,7 @@ class TestInstallRefusesAnUnstartableSystemUnit:
         # The remedy must be the user-scope unit, complete and self-contained.
         assert "systemctl --user enable --now" in msg
         assert "loginctl enable-linger" in msg
-        assert str(svc_linux.USER_UNIT_DIR) in msg
+        assert str(svc_linux.USER_UNIT_SUBDIR) in msg
         assert "WantedBy=default.target" in msg
         assert "ExecStart=" in msg
         # Every command named must exist. `kirocrew service` has only
@@ -495,17 +487,68 @@ class TestInstallRefusesAnUnstartableSystemUnit:
             # A pipe-joined hint like `status|uninstall` names several at once.
             assert set(word.split("|")) <= real, f"unknown subcommand: {word}"
 
+    def test_refusal_never_lets_the_pasting_shell_pick_the_account(self, monkeypatch):
+        """A user unit has no User=, so whoever's manager loads it runs the agent.
+
+        `service install` runs under sudo, so the shell reading this refusal is
+        usually root's. If the remedy said `~` or `$USER` it would name /root and
+        root, and the operator would end up running untrusted agent tools as root
+        -- the exact thing install() refuses outright a few lines earlier. Nothing
+        in the remedy may be resolved by the shell that pastes it.
+        """
+        self._blocked(monkeypatch)
+        with (
+            patch(
+                "kiro_crew.service.common.shutil.which",
+                return_value="/home/tester/.local/bin/kirocrew",
+            ),
+            patch.object(svc_linux, "_home_for_user", return_value="/home/tester"),
+        ):
+            with pytest.raises(svc_linux.ServiceInstallError) as exc:
+                svc_linux.install()
+
+        msg = str(exc.value)
+        assert "$USER" not in msg, "the pasting shell must not choose the account"
+        assert "~/" not in msg, "the pasting shell must not choose the home"
+        # The resolved account and its absolute home instead.
+        assert "/home/tester/.config/systemd/user/kirocrew.service" in msg
+        assert "loginctl enable-linger tester" in msg
+
+    def test_refusal_warns_that_a_root_shell_would_run_the_agent_as_root(self, monkeypatch):
+        """The path names alone are not enough -- an operator pasting into the
+        wrong shell must be told what goes wrong, since a user unit gives no
+        error, it just silently runs as the wrong account."""
+        self._blocked(monkeypatch)
+        with (
+            patch(
+                "kiro_crew.service.common.shutil.which",
+                return_value="/home/tester/.local/bin/kirocrew",
+            ),
+            patch.object(svc_linux, "_home_for_user", return_value="/home/tester"),
+        ):
+            with pytest.raises(svc_linux.ServiceInstallError) as exc:
+                svc_linux.install()
+
+        msg = str(exc.value)
+        assert "AS tester" in msg
+        assert "ROOT" in msg
+        # `sudo -u` looks like the obvious way to run as another account and
+        # cannot work here (no session, so no user manager to talk to).
+        assert "sudo -u tester` is NOT" in msg
+        assert "machinectl shell tester@" in msg
+
     def test_install_proceeds_normally_when_not_blocked(self, monkeypatch):
         """The overwhelmingly common host must be completely unaffected."""
         self._blocked(monkeypatch, blocked=False)
         ok = MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch(
-            "kiro_crew.service.common.shutil.which",
-            return_value="/usr/local/bin/kirocrew",
-        ), patch(
-            "kiro_crew.service.linux.subprocess.run", return_value=ok
-        ) as run:
+        with (
+            patch(
+                "kiro_crew.service.common.shutil.which",
+                return_value="/usr/local/bin/kirocrew",
+            ),
+            patch("kiro_crew.service.linux.subprocess.run", return_value=ok) as run,
+        ):
             svc_linux.install()
 
         called = [list(c.args[0]) for c in run.call_args_list]
@@ -524,10 +567,13 @@ class TestInstallRefusesAnUnstartableSystemUnit:
         )
         ok = MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch(
-            "kiro_crew.service.common.shutil.which",
-            return_value="/home/tester/.local/bin/kirocrew",
-        ), patch("kiro_crew.service.linux.subprocess.run", return_value=ok):
+        with (
+            patch(
+                "kiro_crew.service.common.shutil.which",
+                return_value="/home/tester/.local/bin/kirocrew",
+            ),
+            patch("kiro_crew.service.linux.subprocess.run", return_value=ok),
+        ):
             svc_linux.install()
 
         assert asked == ["/home/tester/.local/bin/kirocrew"]

@@ -81,7 +81,7 @@ _AVD_FLAG_PERMISSIVE = 0x0001
 _SHEBANG_LIMIT = 256
 
 
-def selinux_is_enforcing() -> bool:
+def _is_enforcing() -> bool:
     """True only when the kernel is actively enforcing policy.
 
     In permissive mode the denial is logged and the ``execve`` succeeds, so the
@@ -95,7 +95,7 @@ def selinux_is_enforcing() -> bool:
         return False
 
 
-def system_manager_context() -> str | None:
+def _system_manager_context() -> str | None:
     """SELinux context of PID 1, or None when it cannot be read.
 
     This is the domain that will call ``execve`` on the unit's ``ExecStart`` for
@@ -111,7 +111,7 @@ def system_manager_context() -> str | None:
     return context or None
 
 
-def file_context(path: str) -> str | None:
+def _file_context(path: str) -> str | None:
     """SELinux label of ``path``, following symlinks. None when unavailable.
 
     Symlinks are resolved because the kernel checks the label of the file it
@@ -168,7 +168,7 @@ def _query_access(query: str) -> str | None:
     ``security { compute_av }``. Any failure returns None, which every caller
     treats as "no verdict".
 
-    Separate from :func:`compute_av` so the parsing can be exercised without a
+    Separate from :func:`_compute_av` so the parsing can be exercised without a
     test having to monkeypatch ``os.open`` / ``os.read`` globally — patching
     those breaks pytest's own I/O, and a test that reaches for them is one edit
     away from writing to real selinuxfs.
@@ -187,7 +187,7 @@ def _query_access(query: str) -> str | None:
         os.close(fd)
 
 
-def compute_av(
+def _compute_av(
     source_context: str, target_context: str, object_class: str
 ) -> tuple[int, int] | None:
     """Ask the loaded policy for ``(allowed_vector, flags)``, or None.
@@ -198,9 +198,7 @@ def compute_av(
     class_id = _class_index(object_class)
     if class_id is None:
         return None
-    reply = _query_access(
-        f"{source_context} {target_context} {class_id} ffffffff"
-    )
+    reply = _query_access(f"{source_context} {target_context} {class_id} ffffffff")
     if reply is None:
         return None
     # "allowed decided auditallow auditdeny seqno flags", all hex but seqno.
@@ -248,13 +246,13 @@ def _execute_denied(source_context: str, path: str) -> str | None:
     None means "no proven denial" and covers every indeterminate case: no label,
     no policy answer, a permissive source domain, or an outright ALLOW.
     """
-    label = file_context(path)
+    label = _file_context(path)
     if label is None:
         return None
     execute_bit = _perm_bit("file", "execute")
     if execute_bit is None:
         return None
-    verdict = compute_av(source_context, label, "file")
+    verdict = _compute_av(source_context, label, "file")
     if verdict is None:
         return None
     allowed, flags = verdict
@@ -278,9 +276,9 @@ def blocks_system_unit(exec_path: str) -> tuple[bool, str]:
     is known, and that domain is denied ``execute`` on the file systemd would run
     (the resolved binary, or the interpreter its shebang names).
     """
-    if not selinux_is_enforcing():
+    if not _is_enforcing():
         return False, "SELinux is not enforcing on this host"
-    source_context = system_manager_context()
+    source_context = _system_manager_context()
     if source_context is None:
         return False, f"could not read the system manager's domain from {_SYSTEM_MANAGER_ATTR}"
 
@@ -303,6 +301,5 @@ def blocks_system_unit(exec_path: str) -> tuple[bool, str]:
             )
     return (
         False,
-        f"SELinux policy allows {source_context} to execute "
-        f"{' and '.join(candidates)}",
+        f"SELinux policy allows {source_context} to execute " f"{' and '.join(candidates)}",
     )

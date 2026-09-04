@@ -52,16 +52,13 @@ log = logging.getLogger(__name__)
 
 UNIT_PATH = Path(f"/etc/systemd/system/{SERVICE_NAME}.service")
 
-# The two systemd manager scopes this module can RENDER a unit for. Only
-# SYSTEM_SCOPE is ever installed; USER_SCOPE exists so the remedy printed when a
-# system unit provably cannot start is generated from the same renderer as the
-# real unit instead of hand-written prose that drifts from it.
-SYSTEM_SCOPE = "system"
-USER_SCOPE = "user"
-
-# Where a user-scope unit belongs, per systemd.unit(5). Referenced only in the
-# printed remedy — nothing in this module writes here.
-USER_UNIT_DIR = Path("~/.config/systemd/user")
+# Where a user-scope unit belongs, per systemd.unit(5) — RELATIVE to the service
+# account's home, deliberately. Referenced only in the printed remedy; nothing in
+# this module writes here. It is not spelled "~/.config/..." because "~" resolves
+# against whoever pastes the command, and `service install` is documented to run
+# under sudo — so a tilde would silently name root's home in the one shell the
+# operator is most likely to be sitting in.
+USER_UNIT_SUBDIR = Path(".config/systemd/user")
 
 # Operator-editable environment overrides, read by the unit via
 # ``EnvironmentFile=``. Placed AFTER the baked ``Environment=`` lines in the
@@ -161,8 +158,8 @@ def _home_for_user(user: str) -> str:
         return str(Path.home())
 
 
-def render_unit(*, scope: str = SYSTEM_SCOPE) -> str:
-    """Render the systemd unit file contents for ``scope``.
+def render_unit(*, user_scope: bool = False) -> str:
+    """Render the systemd unit file contents.
 
     Runs the gateway as the invoking user (``User=``, ``Group=``) so it
     has access to ``$HOME/.kiro/crew``, the user's config, etc. The PATH
@@ -179,17 +176,15 @@ def render_unit(*, scope: str = SYSTEM_SCOPE) -> str:
     systemd's ``change_onexec`` transition silently wins over the kernel's
     automatic path attachment, defeating it.
 
-    ``scope`` selects between the installed system unit and the ``--user``
-    variant this module only ever PRINTS (see :func:`selinux_refusal`) — the two
-    are rendered from one function so the copy-pasteable remedy cannot drift
-    from the unit we actually install. Two directives differ, and both are
-    hard requirements of the per-user manager rather than style choices:
-    ``User=``/``Group=`` are rejected outright in a user unit (the manager
-    already runs as that account), and the install target is
-    ``default.target`` because ``multi-user.target`` is a system target the user
-    manager does not have.
+    ``user_scope`` renders the ``systemctl --user`` variant this module only ever
+    PRINTS (see :func:`selinux_refusal`) — rendered here rather than hand-written
+    so the copy-pasteable remedy cannot drift from the unit we actually install.
+    Two directives differ, and both are hard requirements of the per-user manager
+    rather than style choices: ``User=``/``Group=`` are rejected outright in a
+    user unit (the manager already runs as that account), and the install target
+    is ``default.target`` because ``multi-user.target`` is a system target the
+    user manager does not have.
     """
-    user_scope = scope == USER_SCOPE
     bin_path = kirocrew_bin()
     user = _current_user()
     # Only the system unit carries Group=, and resolving it costs an `id -gn`
@@ -517,9 +512,21 @@ def selinux_refusal(reason: str) -> str:
     not prose describing one: the operator's working unit then carries the same
     ``ExecStart`` and the same baked environment as the unit we would have
     installed, and cannot drift from it as this module changes.
+
+    **Every path and account is spelled out, and none is taken from the pasting
+    shell.** A user unit has no ``User=`` — the account it runs as is whichever
+    manager loads it — so ``~`` and ``$USER`` would decide who runs the agent.
+    ``service install`` is documented to run under ``sudo``, so the shell reading
+    this refusal is usually root's: a tilde would name ``/root``, ``$USER`` would
+    expand to ``root``, and the remedy would hand an operator a unit that runs
+    untrusted agent tools as root — defeating the same invariant :func:`install`
+    enforces by refusing a ``User=root`` unit a few lines above. Hence the
+    absolute home, the explicit account name, and the warning below.
     """
-    unit_body = render_unit(scope=USER_SCOPE)
-    user_unit_path = USER_UNIT_DIR / UNIT_PATH.name
+    unit_body = render_unit(user_scope=True)
+    user = _current_user()
+    home = _home_for_user(user) if user else str(Path.home())
+    user_unit_path = Path(home) / USER_UNIT_SUBDIR / UNIT_PATH.name
     return (
         f"Refusing to install a system service that cannot start on this host.\n"
         f"   {reason}.\n"
@@ -533,15 +540,28 @@ def selinux_refusal(reason: str) -> str:
         f"\n"
         f"   A per-user unit is not subject to this: the per-user systemd manager\n"
         f"   does not run in PID 1's domain, so it is allowed to execute a binary\n"
-        f"   under $HOME. Install one with:\n"
+        f"   under $HOME.\n"
         f"\n"
-        f"     mkdir -p {USER_UNIT_DIR}\n"
+        f"   Run the next four commands AS {user or '<the service account>'} — a\n"
+        f"   user unit carries no User=, so it runs as whichever account's manager\n"
+        f"   loads it. Loading it from a root shell (the shell you are probably in,\n"
+        f"   since `service install` needs sudo) would run the agent as ROOT, which\n"
+        f"   this installer otherwise refuses outright. `sudo -u {user}` is NOT\n"
+        f"   enough — it creates no session, so `systemctl --user` cannot reach\n"
+        f"   that account's manager. Get a real session first, e.g.\n"
+        f"   `machinectl shell {user}@`, or just log in as {user}.\n"
+        f"\n"
+        f"     mkdir -p {Path(home) / USER_UNIT_SUBDIR}\n"
         f"     cat > {user_unit_path} <<'KIROCREW_UNIT'\n"
         f"{unit_body}"
         f"KIROCREW_UNIT\n"
         f"     systemctl --user daemon-reload\n"
         f"     systemctl --user enable --now {SERVICE_NAME}.service\n"
-        f"     sudo loginctl enable-linger \"$USER\"\n"
+        f"\n"
+        f"   Then, back in a root shell — this one step needs privilege, and takes\n"
+        f"   the account name explicitly so it cannot land on the wrong user:\n"
+        f"\n"
+        f"     loginctl enable-linger {user}\n"
         f"\n"
         f"   Manage it with `systemctl --user status|restart {SERVICE_NAME}` and\n"
         f"   `journalctl --user -u {SERVICE_NAME} -f`. `kirocrew service "
