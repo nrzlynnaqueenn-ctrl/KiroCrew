@@ -408,7 +408,16 @@ class KnowledgeStore:
         # known to be CJK-segmented, None while unknown. Never cached as False --
         # see `_fts_terms_segmented`.
         self._fts_segmented: bool | None = None
-        self.graph = SimpleDiGraph()
+        # The entity graph is materialised on first READ, not here -- see
+        # `ensure_graph_loaded`. `_graph` is the backing store for the `graph`
+        # property; nothing outside `_load_graph` and that property should touch
+        # it. Guards the lazy first-touch ONLY, on the same reasoning as
+        # `_fts_lock` above: the six refresh call sites rebuild while holding no
+        # lock, and making them wait on this one would order it against SQLite's
+        # writer lock on paths that have just released it.
+        self._graph = SimpleDiGraph()
+        self._graph_loaded = False
+        self._graph_lock = threading.Lock()
         # This constructor runs on the event-loop thread by documented design
         # (see the thread-affinity note above). It is not an edge case:
         # `setup_knowledge_routes()` reads the gateway's lazy `knowledge_store`
@@ -417,17 +426,17 @@ class KnowledgeStore:
         # launch. The take is deliberate, so the on-loop guard -- which exists
         # to police reader/writer query paths -- warned spuriously on every
         # boot (#8231). Deliberate is not free, though: `_migrate()` runs an
-        # unconditional writer-locked orphan sweep and `_load_graph()`
-        # full-scans two tables, both data-scaled (only the FTS rebuild is
-        # deferred to the first off-loop reader). Moving that work off the
-        # boot path is #8329; suppressing the diagnostic for the sanctioned
-        # take is all this block does. The suppression ends with the block:
-        # the six non-constructor `_load_graph()` call sites and every query
-        # path stay fully guarded.
+        # unconditional writer-locked orphan sweep, which is data-scaled and
+        # still runs here. `_load_graph()` no longer does: it is deferred to the
+        # first graph reader (`ensure_graph_loaded`), the same shape the FTS
+        # rebuild already uses, which takes roughly half the construction cost
+        # off the boot path (#8329). Gating the sweep as well would change when
+        # the writer lock is taken, so it stays.
+        # The suppression ends with the block: the six non-constructor
+        # `_load_graph()` call sites and every query path stay fully guarded.
         with _ON_LOOP_DB_GUARD.allow_on_loop():
             self._init_schema()
             self._migrate()
-            self._load_graph()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, timeout=30, isolation_level=None)
@@ -885,13 +894,72 @@ class KnowledgeStore:
         row = self.db.execute(sql + " LIMIT 1", tuple(params)).fetchone()
         return dict(row) if row else None
 
+    @property
+    def graph(self) -> SimpleDiGraph:
+        """The entity graph, materialised on first access.
+
+        A backstop, not the intended entry point. Every reader that can run on
+        the event loop should call :meth:`ensure_graph_loaded` from a worker
+        thread first; this property exists so that a caller nobody found is
+        served a CORRECT graph -- and flagged by the on-loop guard if it is on
+        the loop -- rather than a silently empty one. An empty graph returned to
+        a reader is indistinguishable from "this entity has no neighbours",
+        which is the failure mode worth paying a stall to avoid.
+        """
+        self.ensure_graph_loaded()
+        return self._graph
+
+    def ensure_graph_loaded(self) -> None:
+        """Materialise the entity graph if no reader has done so yet.
+
+        Called by each graph reader before it touches :attr:`graph` --
+        ``get_entity_graph`` and ``get_full_graph`` in the dashboard handlers --
+        from a worker thread via ``asyncio.to_thread``. Deliberately NOT called
+        from ``__init__``, for the reason ``ensure_fts_index_current`` gives
+        about itself: the constructor runs on the event-loop thread and this
+        work is proportional to ``entities`` + ``entity_relations``, so doing it
+        there stalls the gateway before the socket binds (#8329).
+
+        **The offload is load-bearing, not hygiene.** Both handlers are
+        ``async def`` and read the graph on the loop, where the loop-stall
+        watchdog IS armed (it is started after the bind). Reaching this lazily
+        from the loop would move a data-scaled read out of the pre-bind window,
+        where nothing is armed and nothing is served, into the one window where
+        a stall can hard-exit the gateway. ``allow_on_loop()`` is not an option
+        here either -- its own contract restricts it to constructor-shaped setup
+        paths and directs production code to offload.
+
+        Steady state is a single boolean check. The first caller takes the lock
+        and does the work; concurrent readers wait rather than each starting
+        their own scan. The lock is deliberately NOT taken by the six refresh
+        call sites, which rebuild the graph after a mutation while holding no
+        lock: several of them have just released SQLite's writer lock, and
+        making them wait on this one would order the two against each other on
+        exactly those paths. What that leaves is unchanged by this method:
+        :class:`SimpleDiGraph` guards each dict with its own ``RLock``, so no
+        concurrent rebuild can corrupt it or raise, but a ``clear()`` followed by
+        N inserts is not atomic as a unit, so a reader can still observe a
+        partially rebuilt graph during a refresh. That predates this change.
+        What the lock adds is that the FIRST load -- the one this method owns --
+        can no longer be torn by a concurrent refresh, and cannot be run twice.
+        """
+        if self._graph_loaded:
+            return
+        with self._graph_lock:
+            if self._graph_loaded:
+                return
+            self._load_graph()
+
     def _load_graph(self):
-        self.graph.clear()
+        self._graph.clear()
         for row in self.db.execute("SELECT id, name, entity_type FROM entities"):
-            self.graph.add_node(row["id"], name=row["name"], entity_type=row["entity_type"])
+            self._graph.add_node(row["id"], name=row["name"], entity_type=row["entity_type"])
         for row in self.db.execute("SELECT id, source_id, target_id, relation_type, weight FROM entity_relations"):
-            self.graph.add_edge(row["source_id"], row["target_id"],
-                                id=row["id"], relation_type=row["relation_type"], weight=row["weight"])
+            self._graph.add_edge(row["source_id"], row["target_id"],
+                                 id=row["id"], relation_type=row["relation_type"], weight=row["weight"])
+        # Truthful bookkeeping for the refresh call sites too: after any rebuild
+        # the graph IS materialised, so a later first-touch must not scan again.
+        self._graph_loaded = True
 
     def add_item(self, title, content, item_type, source_id=None, chunk_index=0,
                  summary=None, tags=None, embedding=None, namespace="default",
