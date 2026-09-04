@@ -419,6 +419,14 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         # cookie auth and are refused before the handler's own session
         # recognition can run.
         "/api/session-ledger",
+        # MCP-only (panel_publish / panel_templates tools); no browser caller --
+        # the Agent Panels app READS through its own cookie-authed
+        # "/api/apps/agent-panels/..." routes, so nothing in the SPA calls
+        # these. Prefix matching covers both "/api/agent-panel/publish" and
+        # "/api/agent-panel/templates". Same wiring class as the ledger above:
+        # without this entry the internal-secret call falls through to cookie
+        # auth and every publish fails with 403.
+        "/api/agent-panel",
         # MCP-only (knowledge_add_document tool); no browser caller — the
         # dashboard ingests via its own cookie-authed knowledge routes. Same
         # wiring class as "/api/notifications/agent" above.
@@ -1375,6 +1383,12 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_delete("/api/lessons", handlers.api_lessons_delete)
     app.router.add_get("/api/session-ledger", handlers.api_session_ledger_get)
     app.router.add_post("/api/session-ledger/record", handlers.api_session_ledger_record)
+    # The write half of the agent panel surface -- MCP-only, like the ledger
+    # above. The dashboard reads panels through the Agent Panels app's own
+    # cookie-authed routes.
+    from kiro_crew.dashboard.handlers.agent_panel import register_agent_panel_routes
+
+    register_agent_panel_routes(app)
     app.router.add_get("/api/crons", handlers.api_crons)
     app.router.add_post("/api/crons", handlers.api_crons_create)
     app.router.add_delete("/api/crons", handlers.api_cron_batch_delete)

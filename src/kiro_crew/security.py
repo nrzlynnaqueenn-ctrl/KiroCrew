@@ -6390,6 +6390,16 @@ _CREW_SECRET_LEAVES: list[str] = [
     # backend module, which opens paths directly rather than through this
     # gate, so nothing breaks by fencing the whole subtree.
     "ledger",
+    # Operator-authored panel templates (agent_panel.py). Fenced for a stronger
+    # reason than privacy: a crew's webview is a human-authored TEMPLATE filled
+    # with crew-published DATA, and that split is the whole containment story --
+    # layout is reviewed, only data is untrusted, so data can be escaped at one
+    # boundary. An agent's auto-approved file tools could otherwise drop a .html
+    # in here and author markup directly, collapsing the split and handing a
+    # hostile issue body a path into a rendered document. The published data is
+    # deliberately NOT fenced: it lives in the crew's own member space and the
+    # crew owns it anyway.
+    "panel-templates",
     # The optional Playwright extension token. It removes the browser-side approval
     # click for an attach, so a process that could read it could attach to the
     # operator's logged-in browser without them seeing a prompt. The gateway hands
