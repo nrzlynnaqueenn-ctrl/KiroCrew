@@ -4191,3 +4191,570 @@ class TestGptVerdictVisibility:
         assert 'if ! grep -Fq "$reviewed" codex-review-output.md; then' in gate
         assert "Failing closed" in gate
         assert "stale-notice" not in gate
+
+
+def _exec_transcript(runner_temp: Path, review_text: str) -> dict[str, str]:
+    """Write a claude-code execution_file fixture and return its env binding.
+
+    The design-family lanes read the model's review text from the action's
+    transcript (a single result object is one of the three shapes the step's
+    slurp+flatten parse accepts).
+    """
+    exec_file = runner_temp / "execution.json"
+    exec_file.write_text(json.dumps({"result": review_text}), encoding="utf-8")
+    return {"EXEC_FILE": str(exec_file), "REVIEW_OUTCOME": "success"}
+
+
+# One entry per review lane that carries the guarded comment upsert. Each
+# describes how to drive that lane's REAL posting step into a completed run
+# (body carries "<stamp> <head>") and an incomplete one (no verdict for the
+# current head), plus the phrase its incomplete body is known by.
+_GUARDED_LANES = [
+    {
+        "id": "fork-gpt",
+        "workflow": "fork-gpt-review.yml",
+        "step": "Post/update summary comment",
+        "marker": "<!-- codex-ai-review -->",
+        "stamp": "[GPT-REVIEWED]",
+        "slug": "codex",
+        "incomplete_text": "review incomplete",
+        "needs_perl": False,
+        "env": {"ADJ_DECISION": "", "ADJ_NOTE": ""},
+        "completed": lambda cwd, rt, head: (
+            (cwd / "codex-review-output.md").write_text(
+                f"FINDINGS\n[GPT-REVIEWED] {head}\n", encoding="utf-8"
+            ),
+            {},
+        )[1],
+        "incomplete": lambda cwd, rt, head: {},
+    },
+    {
+        "id": "fork-opus",
+        "workflow": "fork-opus-review.yml",
+        "step": "Post/update summary comment",
+        "marker": "<!-- claude-ai-review -->",
+        "stamp": "[OPUS-REVIEWED]",
+        "slug": "claude",
+        "incomplete_text": "review incomplete",
+        "needs_perl": False,
+        "env": {},
+        "completed": lambda cwd, rt, head: (
+            (cwd / "claude-review-output.md").write_text(
+                f"FINDINGS\n[OPUS-REVIEWED] {head}\n", encoding="utf-8"
+            ),
+            {},
+        )[1],
+        "incomplete": lambda cwd, rt, head: {},
+    },
+    {
+        "id": "design",
+        "workflow": "design-review.yml",
+        "step": "Post design review summary",
+        "marker": "<!-- design-review -->",
+        "stamp": "[DESIGN-REVIEWED]",
+        "slug": "design",
+        "incomplete_text": "could not complete",
+        "needs_perl": True,
+        "env": {"HUMAN_OVERRIDE": "false", "OVERRIDE_ACTOR": "", "ACTOR": "someone"},
+        "completed": lambda cwd, rt, head: _exec_transcript(
+            rt, f"Design-Verdict: PASS\n\nsolid reasoning\n\n[DESIGN-REVIEWED] {head}\n"
+        ),
+        "incomplete": lambda cwd, rt, head: _exec_transcript(
+            rt, "Design-Verdict: PASS\n\nstale reasoning\n\n[DESIGN-REVIEWED] feedbead\n"
+        ),
+    },
+    {
+        "id": "ux",
+        "workflow": "ux-review.yml",
+        "step": "Post UX review summary",
+        "marker": "<!-- ux-review -->",
+        "stamp": "[UX-REVIEWED]",
+        "slug": "ux",
+        "incomplete_text": "could not complete",
+        "needs_perl": True,
+        "env": {
+            "HUMAN_OVERRIDE": "false",
+            "OVERRIDE_ACTOR": "",
+            "ACTOR": "someone",
+            "UI_SCOPE": "true",
+        },
+        "completed": lambda cwd, rt, head: _exec_transcript(
+            rt, f"UX-Verdict: PASS\n\nsolid reasoning\n\n[UX-REVIEWED] {head}\n"
+        ),
+        "incomplete": lambda cwd, rt, head: _exec_transcript(
+            rt, "UX-Verdict: PASS\n\nstale reasoning\n\n[UX-REVIEWED] feedbead\n"
+        ),
+    },
+    {
+        "id": "first-principles",
+        "workflow": "first-principles-review.yml",
+        "step": "Post first-principles review summary",
+        "marker": "<!-- first-principles-review -->",
+        "stamp": "[FIRST-PRINCIPLES-REVIEWED]",
+        "slug": "first-principles",
+        "incomplete_text": "could not complete",
+        "needs_perl": True,
+        "env": {
+            "HUMAN_OVERRIDE": "false",
+            "OVERRIDE_ACTOR": "",
+            "ACTOR": "someone",
+            "SURFACE": "true",
+            "CONTRACT": "true",
+        },
+        "completed": lambda cwd, rt, head: _exec_transcript(
+            rt,
+            "First-Principles-Verdict: PASS\n\nsolid reasoning\n\n"
+            f"[FIRST-PRINCIPLES-REVIEWED] {head}\n",
+        ),
+        "incomplete": lambda cwd, rt, head: _exec_transcript(
+            rt,
+            "First-Principles-Verdict: PASS\n\nstale reasoning\n\n"
+            "[FIRST-PRINCIPLES-REVIEWED] feedbead\n",
+        ),
+    },
+    {
+        "id": "fork-design",
+        "workflow": "fork-design-review.yml",
+        "step": "Post/update design review comment",
+        "marker": "<!-- design-review -->",
+        "stamp": "[DESIGN-REVIEWED]",
+        "slug": "design",
+        "incomplete_text": "could not complete",
+        "needs_perl": False,
+        "env": {},
+        "completed": lambda cwd, rt, head: (
+            (rt / "design-review-output.md").write_text(
+                f"solid reasoning\n\n[DESIGN-REVIEWED] {head}\n", encoding="utf-8"
+            ),
+            {"VERDICT": "PASS", "REVIEW_OUTCOME": "success"},
+        )[1],
+        "incomplete": lambda cwd, rt, head: {"VERDICT": "UNKNOWN", "REVIEW_OUTCOME": "failure"},
+    },
+    {
+        "id": "fork-ux",
+        "workflow": "fork-ux-review.yml",
+        "step": "Post UX review summary",
+        "marker": "<!-- ux-review -->",
+        "stamp": "[UX-REVIEWED]",
+        "slug": "ux",
+        "incomplete_text": "could not complete",
+        "needs_perl": True,
+        "env": {"UI_SCOPE": "true"},
+        "completed": lambda cwd, rt, head: _exec_transcript(
+            rt, f"UX-Verdict: PASS\n\nsolid reasoning\n\n[UX-REVIEWED] {head}\n"
+        ),
+        "incomplete": lambda cwd, rt, head: _exec_transcript(
+            rt, "UX-Verdict: PASS\n\nstale reasoning\n\n[UX-REVIEWED] feedbead\n"
+        ),
+    },
+    {
+        "id": "fork-first-principles",
+        "workflow": "fork-first-principles-review.yml",
+        "step": "Post/update first-principles review comment",
+        "marker": "<!-- first-principles-review -->",
+        "stamp": "[FIRST-PRINCIPLES-REVIEWED]",
+        "slug": "first-principles",
+        "incomplete_text": "could not complete",
+        "needs_perl": False,
+        "env": {"WITHHELD": ""},
+        "completed": lambda cwd, rt, head: (
+            (rt / "first-principles-output.md").write_text(
+                f"solid reasoning\n\n[FIRST-PRINCIPLES-REVIEWED] {head}\n", encoding="utf-8"
+            ),
+            {"VERDICT": "PASS", "REVIEW_OUTCOME": "success"},
+        )[1],
+        "incomplete": lambda cwd, rt, head: {"VERDICT": "UNKNOWN", "REVIEW_OUTCOME": "failure"},
+    },
+]
+
+_GUARDED_LANE_PARAMS = [pytest.param(lane, id=lane["id"]) for lane in _GUARDED_LANES]
+
+
+class TestReviewLaneVerdictVisibility:
+    """No review lane may bury a posted verdict under an incomplete body (#8344).
+
+    Twins of ``TestGptVerdictVisibility`` for the eight lanes that upsert a
+    marker-keyed summary comment outside codex-review.yml. Each lane defines
+    the guarded upsert as a byte-identical ``guarded_comment_upsert`` bash
+    function; the identity test pins every copy to one canonical body so the
+    invariant cannot drift lane by lane, and the behavioral tests run each
+    lane's REAL step bash with a stubbed ``gh`` for the contract cases.
+    """
+
+    HEAD = "1234567890abcdef1234567890abcdef12345678"
+    OLD = "aaaa567890abcdef1234567890abcdef1234aaaa"
+
+    def _verdict_body(self, lane: dict, sha: str) -> str:
+        return (
+            f"{lane['marker']}\n"
+            "## Review — 🔴 changes requested (blocking)\n"
+            "\n"
+            f"a completed review of `{sha}`.\n"
+            "\n"
+            f"{lane['stamp']} {sha}\n"
+        )
+
+    def _run_step(
+        self,
+        lane: dict,
+        tmp_path: Path,
+        *,
+        existing_body: str | None,
+        kind: str,
+        extra_env: dict[str, str] | None = None,
+    ) -> tuple[Path, "subprocess.CompletedProcess[bytes]"]:
+        bash = _bash()
+        if bash is None or shutil.which("jq") is None:
+            pytest.skip("lane upsert tests require Bash and jq")
+        if lane["needs_perl"] and shutil.which("perl") is None:
+            pytest.skip("this lane's posting step redacts with perl")
+        if os.name == "nt":
+            pytest.skip("stubbed-PATH gh interception is exercised on POSIX runners")
+
+        stub_dir = tmp_path / "stub"
+        stub_dir.mkdir()
+        calls_dir = tmp_path / "calls"
+        calls_dir.mkdir()
+        runner_temp = tmp_path / "runner-temp"
+        runner_temp.mkdir()
+        cwd = tmp_path / "workspace"
+        cwd.mkdir()
+
+        finder_file = tmp_path / "finder-comments.json"
+        if existing_body is None:
+            finder_file.write_text("[]", encoding="utf-8")
+        else:
+            finder_file.write_text(
+                json.dumps(
+                    [
+                        {"id": 999, "user": {"login": "mallory"}, "body": existing_body},
+                        {"id": 123, "user": {"login": "github-actions[bot]"}, "body": existing_body},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+        if kind == "completed":
+            case_env = lane["completed"](cwd, runner_temp, self.HEAD)
+        elif kind == "incomplete":
+            case_env = lane["incomplete"](cwd, runner_temp, self.HEAD)
+        else:
+            case_env = {}
+
+        gh_stub = stub_dir / "gh"
+        gh_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "# Emulates the two gh surfaces the step uses; records mutations.\n"
+            "# The finder branch runs the step's REAL --jq filter with real jq\n"
+            "# over an array fixture, so a drift in the filter (dropped @json,\n"
+            "# changed author guard) fails these tests instead of hiding.\n"
+            'if [ "$1" = "api" ] && [ "$2" = "--method" ] && [ "$3" = "PATCH" ]; then\n'
+            '  printf \'%s\\n\' "$4" >> "$STUB_CALLS/patch-calls.txt"\n'
+            '  for a in "$@"; do\n'
+            '    case "$a" in body=*) printf \'%s\' "${a#body=}" > "$STUB_CALLS/patched-body.md";; esac\n'
+            "  done\n"
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "api" ]; then\n'
+            "  filter=\"\"\n"
+            "  grab=0\n"
+            '  for a in "$@"; do\n'
+            '    if [ "$grab" = 1 ]; then filter="$a"; grab=0; fi\n'
+            '    [ "$a" = "--jq" ] && grab=1\n'
+            "  done\n"
+            '  jq -r "$filter" < "$FINDER_COMMENTS_FILE"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then\n'
+            "  shift 3\n"
+            '  if [ "$1" = "--body-file" ]; then cp "$2" "$STUB_CALLS/created-body.md"; fi\n'
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        gh_stub.chmod(0o755)
+
+        script = _step_script(_workflow(lane["workflow"]), lane["step"])
+        script_file = tmp_path / "step.sh"
+        script_file.write_text(script, encoding="utf-8")
+
+        env = {
+            **os.environ,
+            "PATH": f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "REPO": "example/repo",
+            "PR": "1",
+            "HEAD": self.HEAD,
+            "GH_TOKEN": "stub-token",
+            "RUNNER_TEMP": str(runner_temp),
+            "STUB_CALLS": str(calls_dir),
+            "FINDER_COMMENTS_FILE": str(finder_file),
+            "GITHUB_OUTPUT": str(tmp_path / "github-output.txt"),
+            **lane["env"],
+            **case_env,
+            **(extra_env or {}),
+        }
+        # GitHub runs `run:` blocks with `bash -e {0}` when no shell is set.
+        result = subprocess.run(
+            [bash, "-e", str(script_file)],
+            check=False,
+            capture_output=True,
+            cwd=cwd,
+            env=env,
+        )
+        return calls_dir, result
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_incomplete_run_never_overwrites_a_posted_verdict(
+        self, lane: dict, tmp_path: Path
+    ) -> None:
+        calls, result = self._run_step(
+            lane, tmp_path, existing_body=self._verdict_body(lane, self.OLD), kind="incomplete"
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        patched = (calls / "patched-body.md").read_text(encoding="utf-8")
+        # The comment finder keys on startswith(marker): the merged body must
+        # keep the marker as its first line.
+        assert patched.startswith(f"{lane['marker']}\n")
+        # The old verdict stays visible, stamp included.
+        assert f"{lane['stamp']} {self.OLD}" in patched
+        # Exactly ONE dated notice, naming the sha whose run failed.
+        assert patched.count(f"<!-- {lane['slug']}-stale-notice-begin -->") == 1
+        assert f"did not produce a completed verdict for `{self.HEAD}`" in patched
+        # The incomplete body itself must not have replaced the verdict.
+        assert lane["incomplete_text"] not in patched
+        assert not (calls / "created-body.md").exists()
+        # The author guard ran inside the real filter: the PATCH must target
+        # the bot's comment (123), not the marker-planting impostor's (999).
+        patch_calls = (calls / "patch-calls.txt").read_text(encoding="utf-8")
+        assert "/comments/123" in patch_calls
+        assert "/comments/999" not in patch_calls
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_completed_verdict_still_replaces_the_comment(
+        self, lane: dict, tmp_path: Path
+    ) -> None:
+        calls, result = self._run_step(
+            lane, tmp_path, existing_body=self._verdict_body(lane, self.OLD), kind="completed"
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        patched = (calls / "patched-body.md").read_text(encoding="utf-8")
+        # A completed verdict replaces the comment wholesale, exactly as before.
+        assert patched.startswith(f"{lane['marker']}\n")
+        assert f"{lane['stamp']} {self.HEAD}" in patched
+        assert f"{lane['stamp']} {self.OLD}" not in patched
+        assert "stale-notice" not in patched
+        assert not (calls / "created-body.md").exists()
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_incomplete_with_no_existing_comment_creates_as_before(
+        self, lane: dict, tmp_path: Path
+    ) -> None:
+        calls, result = self._run_step(lane, tmp_path, existing_body=None, kind="incomplete")
+
+        assert result.returncode == 0, result.stderr.decode()
+        created = (calls / "created-body.md").read_text(encoding="utf-8")
+        assert created.startswith(f"{lane['marker']}\n")
+        assert lane["incomplete_text"] in created
+        assert "stale-notice" not in created
+        assert not (calls / "patched-body.md").exists()
+
+    def test_a_verdict_that_quotes_the_notice_markers_is_not_truncated(
+        self, tmp_path: Path
+    ) -> None:
+        # The preserved body embeds model-authored review prose. A finding
+        # that QUOTES the notice markers must not start an unbounded delete:
+        # the notice strip is exact-whole-line and bounded to the head window,
+        # so quoted markers deep in the verdict text survive and the trailing
+        # stamp stays visible. The function is byte-identical across lanes, so
+        # one lane exercises the shape for all of them.
+        lane = next(entry for entry in _GUARDED_LANES if entry["id"] == "design")
+        existing = (
+            f"{lane['marker']}\n"
+            "## Design Review (Fable 5) — 🔴 BLOCK (blocking)\n"
+            "\n"
+            f"a completed review of `{self.OLD}`.\n"
+            "\n"
+            "BLOCKING — the strip keyed on <!-- design-stale-notice-begin --> can over-delete\n"
+            "Quoted reproduction of the notice block:\n"
+            "```\n"
+            "<!-- design-stale-notice-begin -->\n"
+            "> a quoted notice line\n"
+            "```\n"
+            f"{lane['stamp']} {self.OLD}\n"
+        )
+        calls, result = self._run_step(lane, tmp_path, existing_body=existing, kind="incomplete")
+
+        assert result.returncode == 0, result.stderr.decode()
+        patched = (calls / "patched-body.md").read_text(encoding="utf-8")
+        assert f"{lane['stamp']} {self.OLD}" in patched
+        assert "can over-delete" in patched
+        assert "> a quoted notice line" in patched
+        assert f"did not produce a completed verdict for `{self.HEAD}`" in patched
+
+    def test_a_quoted_begin_marker_inside_the_head_window_is_not_stripped(
+        self, tmp_path: Path
+    ) -> None:
+        # The strip recognizes a previous notice ONLY at its deterministic
+        # position (line 2). Model prose whose exact line 6 is the bare begin
+        # marker sits INSIDE the old head window; a position-blind strip
+        # would silently delete lines 6-8 — blocking-finding content — even
+        # with no end marker anywhere. Lines 1-5 here are the fixed heading
+        # frame, so 6-8 is the earliest prose can carry the quote.
+        lane = next(entry for entry in _GUARDED_LANES if entry["id"] == "design")
+        existing = (
+            f"{lane['marker']}\n"
+            "## Design Review (Fable 5) — 🔴 BLOCK (blocking)\n"
+            "\n"
+            f"a completed review of `{self.OLD}`.\n"
+            "\n"
+            f"<!-- {lane['slug']}-stale-notice-begin -->\n"
+            "BLOCKING — the notice strip can over-delete when prose quotes\n"
+            "the begin marker as its own line inside the head window\n"
+            "\n"
+            f"{lane['stamp']} {self.OLD}\n"
+        )
+        calls, result = self._run_step(lane, tmp_path, existing_body=existing, kind="incomplete")
+
+        assert result.returncode == 0, result.stderr.decode()
+        patched = (calls / "patched-body.md").read_text(encoding="utf-8")
+        # The quoted marker line and BOTH prose lines behind it survive.
+        assert f"<!-- {lane['slug']}-stale-notice-begin -->\nBLOCKING — the notice strip" in patched
+        assert "as its own line inside the head window" in patched
+        assert f"{lane['stamp']} {self.OLD}" in patched
+        # And the fresh notice was still prepended (before the preserved body).
+        assert f"did not produce a completed verdict for `{self.HEAD}`" in patched
+
+    def test_an_unterminated_genuine_notice_is_restored_not_deleted_past(
+        self, tmp_path: Path
+    ) -> None:
+        # A begin marker at line 2 with NO end marker anywhere (a shape this
+        # function never writes, but the failure mode of stripping past a
+        # missing terminator is verdict deletion): the buffered block is
+        # restored verbatim, trading a stacked notice for zero data loss.
+        lane = next(entry for entry in _GUARDED_LANES if entry["id"] == "design")
+        existing = (
+            f"{lane['marker']}\n"
+            f"<!-- {lane['slug']}-stale-notice-begin -->\n"
+            "> ⚠️ **Stale verdict notice (2026-01-01 00:00 UTC):** orphaned, no end marker.\n"
+            "\n"
+            "## Design Review (Fable 5) — 🔴 BLOCK (blocking)\n"
+            "\n"
+            f"a completed review of `{self.OLD}`.\n"
+            "\n"
+            f"{lane['stamp']} {self.OLD}\n"
+        )
+        calls, result = self._run_step(lane, tmp_path, existing_body=existing, kind="incomplete")
+
+        assert result.returncode == 0, result.stderr.decode()
+        patched = (calls / "patched-body.md").read_text(encoding="utf-8")
+        assert "orphaned, no end marker" in patched
+        assert "🔴 BLOCK (blocking)" in patched
+        assert f"{lane['stamp']} {self.OLD}" in patched
+        assert f"did not produce a completed verdict for `{self.HEAD}`" in patched
+
+    def test_notice_replaces_a_previous_notice_instead_of_stacking(
+        self, tmp_path: Path
+    ) -> None:
+        lane = next(entry for entry in _GUARDED_LANES if entry["id"] == "fork-opus")
+        existing = (
+            f"{lane['marker']}\n"
+            f"<!-- {lane['slug']}-stale-notice-begin -->\n"
+            "> ⚠️ **Stale verdict notice (2026-01-01 00:00 UTC):** a later run did not"
+            " produce a completed verdict for `feedbead`.\n"
+            f"<!-- {lane['slug']}-stale-notice-end -->\n"
+            "\n" + self._verdict_body(lane, self.OLD).removeprefix(f"{lane['marker']}\n")
+        )
+        calls, result = self._run_step(lane, tmp_path, existing_body=existing, kind="incomplete")
+
+        assert result.returncode == 0, result.stderr.decode()
+        patched = (calls / "patched-body.md").read_text(encoding="utf-8")
+        assert patched.count(f"<!-- {lane['slug']}-stale-notice-begin -->") == 1
+        assert "feedbead" not in patched
+        assert f"did not produce a completed verdict for `{self.HEAD}`" in patched
+        assert f"{lane['stamp']} {self.OLD}" in patched
+
+    def test_withheld_fork_fp_body_preserves_a_posted_verdict(self, tmp_path: Path) -> None:
+        # The fork first-principles lane posts its withheld notice from a
+        # separate early site; it routes through the same guarded upsert, so a
+        # credential-shaped output discards the body without burying the
+        # previously posted verdict.
+        lane = next(entry for entry in _GUARDED_LANES if entry["id"] == "fork-first-principles")
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=self._verdict_body(lane, self.OLD),
+            kind="none",
+            extra_env={"WITHHELD": "true", "VERDICT": "UNKNOWN", "REVIEW_OUTCOME": "success"},
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        patched = (calls / "patched-body.md").read_text(encoding="utf-8")
+        assert f"{lane['stamp']} {self.OLD}" in patched
+        assert patched.count(f"<!-- {lane['slug']}-stale-notice-begin -->") == 1
+        assert "output withheld" not in patched
+
+    def test_skip_notice_still_replaces_the_comment_wholesale(self, tmp_path: Path) -> None:
+        # A skip notice is a COMPLETED determination about the current head
+        # (the revision ships no reviewable surface), not a review failure, so
+        # it deliberately keeps the unguarded replace: guarding it would pin a
+        # stale verdict onto a revision the lane has ruled out of scope.
+        lane = next(entry for entry in _GUARDED_LANES if entry["id"] == "ux")
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=self._verdict_body(lane, self.OLD),
+            kind="none",
+            extra_env={"UI_SCOPE": "false", "EXEC_FILE": "", "REVIEW_OUTCOME": "success"},
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        patched = (calls / "patched-body.md").read_text(encoding="utf-8")
+        assert "⏭️ skipped" in patched
+        assert f"{lane['stamp']} {self.OLD}" not in patched
+        assert "stale-notice" not in patched
+
+    def test_guard_function_is_byte_identical_across_all_lanes(self) -> None:
+        bodies = set()
+        for lane in _GUARDED_LANES:
+            script = _step_script(_workflow(lane["workflow"]), lane["step"])
+            bodies.add(_shell_function(script, "guarded_comment_upsert"))
+        assert len(bodies) == 1, (
+            "guarded_comment_upsert must stay byte-identical across every "
+            "review lane; edit all copies together"
+        )
+        canonical = bodies.pop()
+        # The body is captured in the SAME query that finds the id, and the
+        # first match is selected off the captured value, never via a
+        # `| head -n1` inside the pipeline (SIGPIPE under pipefail).
+        assert "| {id, body} | @json" in canonical
+        code_lines = [
+            line for line in canonical.splitlines() if not line.lstrip().startswith("#")
+        ]
+        assert not any("head -n1" in line for line in code_lines)
+        assert any("| awk 'NR == 1'" in line for line in code_lines)
+        # The notice strip recognizes a previous notice ONLY at its
+        # deterministic position (whole-line begin marker at line 2) and only
+        # drops it when the end marker closes within the head window; an
+        # unterminated block is restored from the buffer.
+        assert "NR == 1 && $0 == m { next }" in canonical
+        assert "NR == 2 && $0 == nb" in canonical
+        assert "END { if (buffering) print buf }" in canonical
+        # A failed lookup falls through to CREATE, never to a blind PATCH.
+        assert 'gh pr comment "$PR" --body-file "$out_file"' in canonical
+
+    def test_every_lane_calls_the_guard_and_fork_fp_covers_both_sites(self) -> None:
+        for lane in _GUARDED_LANES:
+            script = _step_script(_workflow(lane["workflow"]), lane["step"])
+            calls = [
+                line.strip()
+                for line in script.splitlines()
+                if line.strip().startswith("guarded_comment_upsert ")
+            ]
+            expected = 2 if lane["id"] == "fork-first-principles" else 1
+            assert len(calls) == expected, (lane["id"], calls)
+            for call in calls:
+                assert f'"{lane["stamp"]}"' in call
+                assert f'"{lane["slug"]}"' in call
