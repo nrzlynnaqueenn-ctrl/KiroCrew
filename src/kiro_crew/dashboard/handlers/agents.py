@@ -13,7 +13,7 @@ import stat
 import subprocess
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from aiohttp import web
 
@@ -2563,6 +2563,140 @@ async def api_capability_mcp_registry(request: web.Request) -> web.Response:
 # ── KiroCrew Agent CRUD API ──
 
 
+# Exactly the fields the agents page writes back. `saveEdit` sends all of them
+# UNCONDITIONALLY -- deliberately, so `""` can clear a pin -- after `openEdit`
+# seeded the sheet from a roster row. So a read-side transform of any of these
+# is persisted over the operator's original on the next save of an unrelated
+# field, and the OWNER must receive them byte-identical. Keep in step with
+# `AgentUpdatePayload` in `website/src/pages/KiroCrewAgentsPage.tsx`;
+# `test_agents_roster_contract.py` pins the set.
+_EDITOR_WRITTEN_BACK = frozenset(
+    {
+        "kiro_agent",
+        "workspace",
+        "memory_store",
+        "triggers",
+        "model",
+        "reasoning_effort",
+        "session_color",
+    }
+)
+
+
+def _roster_value(value: object, *, scrub: bool) -> object:
+    """Serialize ONE agent-record value for a roster row.
+
+    ``scrub=True`` flattens the value to ``str`` (a non-string fails closed to
+    ``""``) and runs ``_redact_external`` -- credentials, then exfiltration URLs,
+    then the lexical URL-parameter scrub. ``scrub=False`` passes it through
+    byte-identical.
+
+    The caller decides per field, and the rule is the one
+    ``_masked_config_dict`` already states for the config endpoint: **a
+    read-side transform is safe exactly where no write path accepts its
+    output.** ``_agent_roster_row`` applies that literally -- see there.
+    """
+    if not scrub:
+        return value
+    if not isinstance(value, str):
+        return ""
+    return _redact_external(value)
+
+
+def _agent_roster_row(
+    name: str, scope: str, agent_cfg: KiroCrewAgentConfig, *, redact: bool
+) -> dict[str, object]:
+    """Serialize ONE ``GET /api/agents`` roster row.
+
+    **Key half.** Explicit allowlist -- never a ``dataclasses.asdict`` spread,
+    mirroring the rule ``handlers/members.py`` already documents for
+    ``GET /api/members``. The response is a network-boundary contract, and a
+    spread makes that contract "every field ``KiroCrewAgentConfig`` has now, plus
+    every field anyone adds later", automatically -- so a field added by someone
+    who never looked at this endpoint (internal bookkeeping, a filesystem path, a
+    capability hint, a credential-shaped one) ships to the browser by omission.
+    Naming each field inverts the default: nothing leaves unless it is added here
+    deliberately (#8454). Both row sources go through this one function, so the
+    ``cfg.agents`` rows and the project-scope rows cannot drift into different
+    key sets.
+
+    **Value half.** Every record value is agent- or package-writable: an agent
+    can edit ``config.json`` directly, and ``_do_agents_sync`` copies
+    ``description`` straight off a discovered agent spec, so a third-party
+    package controls that string. They are therefore scrubbed -- EXCEPT where
+    scrubbing would destroy stored config, which is decided per field rather
+    than per response:
+
+    * A field in ``_EDITOR_WRITTEN_BACK`` is returned to the OWNER verbatim.
+      ``saveEdit`` sends those back unconditionally, so a transform would be
+      persisted over the operator's original. This is the invariant
+      ``_masked_config_dict``'s docstring states -- a read-side mask is safe only
+      while no write endpoint accepts its output -- applied here as "scrub
+      exactly what is not written back".
+    * Everything else is scrubbed for the owner too: ``description`` and
+      ``source`` are not in ``AgentUpdatePayload``, so no write path accepts
+      them and there is nothing to overwrite.
+    * For an ``app`` token (``redact=True``) EVERY value is scrubbed, including
+      the written-back ones and ``name``. Nothing is exempt because nothing is
+      reachable: every mutating agent route is ``_require_owner``-gated, so an
+      app token has no write path at all, and app-token scope is deny-by-default
+      per path (``app_token_path_allowed``: the implicit allowlist is
+      ``/api/ws``, and a manifest ``api`` entry matches by prefix at a path
+      boundary), so an app granted ``/api/agents`` cannot read the same records
+      from ``/api/config/kirocrew`` either. For that caller this row is the only
+      door, which is what makes scrubbing it reduce exposure rather than
+      relocate it.
+
+    ``name`` is the one field whose treatment differs by caller for a reason
+    other than write-back: for the owner it is the row's IDENTITY, addressing
+    ``/api/agents/{name}`` for edit and delete and keying the usage sort, so
+    transforming it would make the row unaddressable. An app token cannot reach
+    those owner-gated routes, so that argument buys it nothing and the field is
+    scrubbed there -- crew creation enforces only that a name is non-empty (the
+    shared ``_AGENT_NAME_RE`` grammar guards ``kiro_agent``, not ``name``), so it
+    is agent-writable text like any other. The cost is named rather than hidden:
+    an app that reads a roster name and feeds it to another route sees the
+    scrubbed form, which only differs for a name that contains credential- or
+    URL-shaped text.
+
+    ``scope`` is never scrubbed: it is a literal written here, not record
+    content. The return type is ``dict[str, object]`` because the owner path is
+    honest about the loader -- although every allowlisted field is DECLARED
+    ``str``, a hand-edited ``config.json`` putting an object under
+    ``kiro_agent``, ``workspace``, ``memory_store``, ``description`` or
+    ``source`` reaches the record verbatim, and coercing a written-back field
+    would be the same data-loss bug as scrubbing it.
+
+    Excluded on purpose, each verified to have NO consumer in ``website/src``:
+    ``watchdog_tool_stall_suspect_secs`` and ``watchdog_tool_stall_hard_cap_secs``
+    (per-agent watchdog windows -- backend scheduling knobs the roster does not
+    render) and ``telegram_account`` (deprecated and inert, and the one record
+    field naming an external messaging binding). Adding any of them back is a
+    one-line change plus the pinned key set.
+    """
+    record: dict[str, object] = {
+        "kiro_agent": agent_cfg.kiro_agent,
+        "workspace": agent_cfg.workspace,
+        "memory_store": agent_cfg.memory_store,
+        "model": agent_cfg.model,
+        "reasoning_effort": agent_cfg.reasoning_effort,
+        "description": agent_cfg.description,
+        "triggers": agent_cfg.triggers,
+        "source": agent_cfg.source,
+        "session_color": agent_cfg.session_color,
+    }
+    row: dict[str, object] = {
+        "name": _roster_value(name, scrub=redact),
+        # The #1684 project-scope tag: "project" rows dispatch only from the
+        # slot whose project they were scanned from. Handler-added, not a
+        # record field.
+        "scope": scope,
+    }
+    for field, value in record.items():
+        row[field] = _roster_value(value, scrub=redact or field not in _EDITOR_WRITTEN_BACK)
+    return row
+
+
 async def api_kirocrew_agents(request: web.Request) -> web.Response:
     """GET /api/agents — list all Kiro Crew agent definitions, most-used first.
 
@@ -2574,8 +2708,13 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
     dispatch resolves aliases first, so the alias is what would answer.
     """
     cfg = KiroCrewConfig.load()
+    # Caller class, resolved once for the whole response. Non-empty ``app`` is an
+    # app token (the same predicate ``members.py::_deny_app_caller`` uses);
+    # empty is the dashboard owner. It decides only VALUE treatment, never the
+    # key set -- see ``_roster_value``.
+    redact = bool(request.get("app", ""))
     agents = [
-        {"name": name, "scope": "global", **dataclasses.asdict(agent_cfg)}
+        _agent_roster_row(name, "global", agent_cfg, redact=redact)
         for name, agent_cfg in cfg.agents.items()
     ]
 
@@ -2599,9 +2738,12 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
         except Exception:
             logger.warning("Failed to list project agents for %s", project_dir, exc_info=True)
             project_names = frozenset()
-        base = dataclasses.asdict(KiroCrewAgentConfig())
+        # One shared default record for every project row — they carry no
+        # per-agent config of their own (nothing on disk to read without a
+        # second scan), so the row is the default record under a project tag.
+        project_default = KiroCrewAgentConfig()
         agents.extend(
-            {"name": name, "scope": "project", **base}
+            _agent_roster_row(name, "project", project_default, redact=redact)
             for name in sorted(project_names - set(cfg.agents.keys()))
         )
 
@@ -2617,9 +2759,14 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
             # their config-insertion index and form a stable bottom block.
             sorted_agents = sorted(
                 enumerate(agents),
+                # ``name`` is a config dict key or a scanned project name, so it
+                # is always a ``str``; the row's value type is ``object`` because
+                # OTHER fields can hold a malformed non-string (see
+                # ``_roster_value``), which is why this needs a cast rather than
+                # a runtime check that could never fire.
                 key=lambda item: (
-                    -usage.get(item[1]["name"], (0, 0.0))[0],
-                    -usage.get(item[1]["name"], (0, 0.0))[1],
+                    -usage.get(cast(str, item[1]["name"]), (0, 0.0))[0],
+                    -usage.get(cast(str, item[1]["name"]), (0, 0.0))[1],
                     item[0],
                 ),
             )
